@@ -1,0 +1,37 @@
+# ── Rust ──
+target/
+# Cargo.lock 必须提交：NovaCode 是产出二进制的应用，锁定依赖版本保证 CI 与本地构建可复现，
+# 避免 CI 全新解析拿到不兼容的传递依赖（如 time crate 触发 coherence 编译错误）。
+
+# ── Node ──
+node_modules/
+dist/
+.turbo/
+
+# ── Tauri ──
+apps/desktop/src-tauri/target/
+apps/desktop/dist/
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ──
+.vscode/settings.json
+.idea/
+*.suo
+*.user
+
+# ── Env ──
+.env
+.env.*
+
+# ── Dev collaboration rules (local only, never upload) ──
+.dev-rules.md
+
+# ── Internal migration scaffolding (local only, keeps legacy names out of the public repo) ──
+NOVA_CODE_MIGRATION_PLAN.md
+
+# ── Claude Code local settings ──
+.claude/

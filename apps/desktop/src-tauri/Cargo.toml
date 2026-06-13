@@ -1,0 +1,30 @@
+[package]
+name = "novacode-desktop"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+novacode-deepseek-client = { path = "../../../crates/deepseek-client" }
+novacode-mcp-client = { path = "../../../crates/mcp-client" }
+novacode-sandbox-runtime = { path = "../../../crates/sandbox-runtime" }
+novacode-shared = { path = "../../../crates/shared" }
+novacode-storage = { path = "../../../crates/storage" }
+novacode-token-accounting = { path = "../../../crates/token-accounting" }
+novacode-tool-runtime = { path = "../../../crates/tool-runtime" }
+rusqlite.workspace = true
+similar.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-updater = "2"
+pdf-extract = "0.7"
+zip = "2"
+reqwest.workspace = true
+futures-util.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

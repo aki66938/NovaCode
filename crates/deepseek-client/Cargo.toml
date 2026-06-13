@@ -1,0 +1,14 @@
+[package]
+name = "novacode-deepseek-client"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+novacode-shared = { path = "../shared" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+futures-util.workspace = true

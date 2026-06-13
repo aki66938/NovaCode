@@ -1,0 +1,51 @@
+Modified MIT License
+
+Copyright (c) 2025-2026 aki66938 (NovaCode)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+ADDITIONAL ATTRIBUTION CONDITIONS (the modification to the MIT License):
+
+1. Source Attribution. Any redistribution, derivative work, or product that is
+   based on, borrows from, or is substantially derived from the Software must
+   retain a clear and visible attribution to the original project in its
+   documentation, "About" information, source headers, or an equivalent
+   conspicuous location. The attribution must state, at minimum:
+
+       Based on NovaCode by aki66938
+       https://github.com/aki66938/NovaCode
+
+   Removing, obscuring, or misrepresenting the origin of the Software is not
+   permitted.
+
+2. Prominent Display for Large-Scale Commercial Use. If the Software (or any
+   derivative work thereof) is used in or as part of a commercial product or
+   service that has more than 100 million monthly active users, OR more than
+   20 million US dollars (or the equivalent in other currencies) in monthly
+   revenue, you shall prominently display "NovaCode" on the user interface of
+   such product or service (for example, in an "About", "Powered by", or
+   credits section).
+
+3. No Trademark Grant. This License does not grant permission to use the trade
+   names, the "NovaCode" name, or logos of the original author, except as
+   required to satisfy the attribution conditions above.
+
+These additional conditions are intended to keep the project open for study,
+modification, and reuse, while protecting the identity and provenance of the
+original work. Apart from these conditions, all terms of the MIT License apply.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build-windows:
+    name: Build Windows Installer
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"           # e.g. v0.0.1
+          SEMVER="${TAG#v}"                  # 0.0.1  (三位，直接写入 tauri.conf.json)
+          echo "semver=$SEMVER" >> $GITHUB_OUTPUT
+
+      - name: Patch tauri.conf.json version
+        shell: bash
+        run: |
+          sed -i "s/\"version\": \".*\"/\"version\": \"${{ steps.version.outputs.semver }}\"/" \
+            apps/desktop/src-tauri/tauri.conf.json
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: "NovaCode ${{ github.ref_name }}"
+          releaseBody: |
+            ## NovaCode ${{ github.ref_name }}
+
+            Windows 桌面安装包，下载 `.msi`（推荐）或 `.exe` 安装即可。
+
+            **使用前提**：在 Windows 系统环境变量中配置 `DEEPSEEK_API_KEY`，应用启动后自动识别。
+
+            完整更新记录见 [doc/history.md](https://github.com/aki66938/NovaCode/blob/main/doc/history.md)
+          releaseDraft: false
+          prerelease: false

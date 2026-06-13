@@ -1,0 +1,10 @@
+[package]
+name = "novacode-sandbox-runtime"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+novacode-shared = { path = "../shared" }
+serde.workspace = true
+thiserror.workspace = true
