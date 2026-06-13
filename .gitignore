@@ -27,8 +27,10 @@ desktop.ini
 .env
 .env.*
 
-# ── Dev collaboration rules (local only, never upload) ──
-.dev-rules.md
+# ── Local-only secrets & private notes (never upload) ──
+# .dev-rules.md itself IS committed (contributors and their AI agents need it),
+# but anything carrying secrets must live in a *.local.md file that stays here.
+*.local.md
 
 # ── Internal migration scaffolding (local only, keeps legacy names out of the public repo) ──
 NOVA_CODE_MIGRATION_PLAN.md

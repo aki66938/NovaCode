@@ -111,6 +111,18 @@ cargo test --workspace
 
 ---
 
+## 贡献与治理
+
+NovaCode 采用 `dev → main` 分支模型:贡献者基于 `dev` 开发并提 PR,经维护者审阅与主创真机验证后合并发版。
+
+- 如何贡献:[CONTRIBUTING.md](CONTRIBUTING.md)
+- 角色、权力、继承、fork 规则:[GOVERNANCE.md](GOVERNANCE.md)
+- 当前维护者(权限事实源):[MAINTAINERS.md](MAINTAINERS.md)
+
+欢迎 fork 二开;唯一硬约束是遵守许可证的出处署名。
+
+---
+
 ## 许可证
 
 NovaCode 采用 **Modified MIT License**（修改版 MIT，参照 Kimi K2 范式）：

@@ -2,7 +2,7 @@ name: Build Check
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     paths:
       - "apps/**"
       - "crates/**"
@@ -12,7 +12,7 @@ on:
       - "package.json"
       - "package-lock.json"
   pull_request:
-    branches: [main]
+    branches: [main, dev]
     paths:
       - "apps/**"
       - "crates/**"
