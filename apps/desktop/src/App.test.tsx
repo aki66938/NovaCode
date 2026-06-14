@@ -37,7 +37,7 @@ describe("desktop MVP shell", () => {
     });
   });
 
-  it("renders the core MVP status regions", async () => {
+  it("renders the core MVP status regions", () => {
     render(<App />);
 
     expect(screen.getByRole("heading", { name: "NovaCode" })).toBeTruthy();
@@ -105,18 +105,18 @@ describe("desktop MVP shell", () => {
   });
 
   it("selects a workspace on the new conversation screen and binds it to the created conversation", async () => {
-    mocks.open.mockResolvedValue("C:\\Users\\AIT\\Desktop\\NovaCode");
+    mocks.open.mockResolvedValue("C:\\workspace\\demo");
     mocks.invoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "get_deepseek_api_key_status") return Promise.resolve("Configured");
       if (command === "check_update") return Promise.resolve(null);
       if (command === "get_conversations") return Promise.resolve([]);
       if (command === "new_conversation_with_workspace") {
-        expect(args?.workspacePath).toBe("C:\\Users\\AIT\\Desktop\\NovaCode");
+        expect(args?.workspacePath).toBe("C:\\workspace\\demo");
         return Promise.resolve({
           id: "conv-1",
           title: "新对话",
           workspacePath: args?.workspacePath,
-          workspaceName: "NovaCode",
+          workspaceName: "demo",
           mode: "local_workspace",
           createdAt: 1,
           updatedAt: 1,
@@ -134,7 +134,7 @@ describe("desktop MVP shell", () => {
 
     await waitFor(() => {
       const selector = screen.getByLabelText("New conversation workspace");
-      expect(within(selector).getByText("NovaCode")).toBeTruthy();
+      expect(within(selector).getByText("demo")).toBeTruthy();
     });
 
     fireEvent.change(screen.getByLabelText("Message"), { target: { value: "帮我分析这个项目" } });
@@ -142,7 +142,7 @@ describe("desktop MVP shell", () => {
 
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith(
       "new_conversation_with_workspace",
-      { workspacePath: "C:\\Users\\AIT\\Desktop\\NovaCode" }
+      { workspacePath: "C:\\workspace\\demo" }
     ));
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith(
       "send_message",

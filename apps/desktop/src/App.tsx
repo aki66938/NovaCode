@@ -13,7 +13,7 @@ import {
   ChevronDown, FolderOpen, Gauge, AtSign, CornerDownRight,
 } from "lucide-react";
 
-/** NovaCode 品牌标识：星火代码波纹 */
+/** NovaCode 品牌标识：深海声纳波纹（致敬 DeepSeek 的「deep」，非官方鲸鱼 logo） */
 function BrandMark({ size = 24 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 32 32" aria-hidden="true">
@@ -104,6 +104,16 @@ type ApprovalRequest = {
   toolName: string;
   target: string;
 };
+
+/** ask_user 结构化提问：Agent 在需求含糊时主动发起，前端弹选择卡片 */
+type AskOption = { label: string; description?: string };
+type AskQuestion = {
+  question: string;
+  header?: string;
+  multiSelect?: boolean;
+  options: AskOption[];
+};
+type AskUserRequest = { questionId: string; questions: AskQuestion[] };
 
 /** 系统通知卡片：上下文压缩等用户需要感知的运行时事件，内联显示在对话流中 */
 type NoticePart = { type: "notice"; text: string };
@@ -206,6 +216,7 @@ export function App() {
   const [draftWorkspace, setDraftWorkspace] = useState<DraftWorkspace | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
+  const [askUser, setAskUser] = useState<AskUserRequest | null>(null);
   // 侧边栏：搜索过滤、行内重命名、归档区展开
   const [searchQuery, setSearchQuery] = useState("");
   const [editingConvId, setEditingConvId] = useState<string | null>(null);
@@ -275,6 +286,16 @@ export function App() {
   useEffect(() => {
     const unlisten = listen<ApprovalRequest>("approval-request", (e) => {
       setApproval(e.payload);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // 监听 Agent 发起的 ask_user 结构化提问，弹出选择卡片
+  useEffect(() => {
+    const unlisten = listen<AskUserRequest>("ask-user-request", (e) => {
+      setAskUser(e.payload);
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -788,6 +809,7 @@ export function App() {
     const unlistenDone = await listen("chat-done", async () => {
       setSending(false);
       setApproval(null);
+      setAskUser(null);
       setQueuedSteering([]);
       unlistenChunk();
       unlistenTool();
@@ -886,6 +908,13 @@ export function App() {
     const actionId = approval.actionId;
     setApproval(null);
     await invoke("respond_approval", { actionId, approved, remember }).catch(() => {});
+  }
+
+  async function respondAskUser(answer: string) {
+    if (!askUser) return;
+    const questionId = askUser.questionId;
+    setAskUser(null);
+    await invoke("respond_ask_user", { questionId, answer }).catch(() => {});
   }
 
   async function openChangesPanel() {
@@ -1242,7 +1271,7 @@ export function App() {
             className="sidebar-footer__icon"
             type="button"
             aria-label={theme === "dark" ? "切换到亮色" : "切换到深色"}
-            title={theme === "dark" ? "切换到亮色" : "切换到深色"}
+            title={theme === "dark" ? "切换到亮色" : "切换到深色「深海」"}
             onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
           >
             {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
@@ -1476,6 +1505,14 @@ export function App() {
           onAllow={() => respondApproval(true)}
           onAlwaysAllow={() => respondApproval(true, true)}
           onDeny={() => respondApproval(false)}
+        />
+      )}
+
+      {askUser && (
+        <AskUserModal
+          request={askUser}
+          onSubmit={respondAskUser}
+          onCancel={() => respondAskUser("")}
         />
       )}
 
@@ -1944,6 +1981,136 @@ function ApprovalModal({
           </button>
           <button type="button" className="approval-card__btn" onClick={onDeny}>
             拒绝
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── AskUserModal ──────────────────────────────────────────────────────────────
+
+/** Agent 发起的结构化澄清提问：每题渲染可点选项卡片，自动附「其他」自定义输入。 */
+function AskUserModal({
+  request,
+  onSubmit,
+  onCancel,
+}: {
+  request: AskUserRequest;
+  onSubmit: (answer: string) => void;
+  onCancel: () => void;
+}) {
+  const questions = request.questions;
+  // 每题已选 label 集合；"__other__" 代表选中了自定义项。
+  const [selected, setSelected] = useState<Record<number, Set<string>>>(() =>
+    Object.fromEntries(questions.map((_, i) => [i, new Set<string>()])),
+  );
+  const [otherText, setOtherText] = useState<Record<number, string>>({});
+
+  function toggle(qIndex: number, label: string, multi: boolean) {
+    setSelected((prev) => {
+      const next = { ...prev };
+      const set = new Set(next[qIndex]);
+      if (multi) {
+        if (set.has(label)) set.delete(label);
+        else set.add(label);
+      } else {
+        if (set.has(label)) set.clear();
+        else {
+          set.clear();
+          set.add(label);
+        }
+      }
+      next[qIndex] = set;
+      return next;
+    });
+  }
+
+  // 每题至少有一项选择（普通选项，或选了「其他」且填了文本）才能提交。
+  const ready = questions.every((_, i) => {
+    const set = selected[i] ?? new Set<string>();
+    const hasOption = Array.from(set).some((s) => s !== "__other__");
+    const hasOther = set.has("__other__") && (otherText[i] ?? "").trim().length > 0;
+    return hasOption || hasOther;
+  });
+
+  function submit() {
+    const answer = questions.map((q, i) => {
+      const set = selected[i] ?? new Set<string>();
+      const picks = Array.from(set).filter((s) => s !== "__other__");
+      if (set.has("__other__") && (otherText[i] ?? "").trim()) {
+        picks.push(otherText[i].trim());
+      }
+      return { question: q.question, header: q.header ?? "", selected: picks };
+    });
+    onSubmit(JSON.stringify(answer));
+  }
+
+  return (
+    <div className="approval-overlay" role="dialog" aria-modal="true" aria-label="Agent 提问">
+      <div className="approval-card askuser-card">
+        <p className="approval-card__title">Agent 需要你确认</p>
+        <div className="askuser-questions">
+          {questions.map((q, i) => {
+            const multi = q.multiSelect === true;
+            const set = selected[i] ?? new Set<string>();
+            return (
+              <div className="askuser-question" key={i}>
+                <div className="askuser-question__head">
+                  {q.header && <span className="askuser-chip">{q.header}</span>}
+                  <span className="askuser-question__text">{q.question}</span>
+                </div>
+                <div className="askuser-options">
+                  {q.options.map((opt, j) => (
+                    <button
+                      type="button"
+                      key={j}
+                      className={`askuser-option${set.has(opt.label) ? " askuser-option--on" : ""}`}
+                      onClick={() => toggle(i, opt.label, multi)}
+                    >
+                      <span className="askuser-option__label">{opt.label}</span>
+                      {opt.description && (
+                        <span className="askuser-option__desc">{opt.description}</span>
+                      )}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    className={`askuser-option${set.has("__other__") ? " askuser-option--on" : ""}`}
+                    onClick={() => toggle(i, "__other__", multi)}
+                  >
+                    <span className="askuser-option__label">其他…</span>
+                    <span className="askuser-option__desc">自定义回答</span>
+                  </button>
+                  {set.has("__other__") && (
+                    <input
+                      className="askuser-other-input"
+                      type="text"
+                      placeholder="输入你的回答"
+                      value={otherText[i] ?? ""}
+                      onChange={(e) =>
+                        setOtherText((prev) => ({ ...prev, [i]: e.target.value }))
+                      }
+                      autoFocus
+                    />
+                  )}
+                </div>
+                {multi && <p className="askuser-multi-hint">可多选</p>}
+              </div>
+            );
+          })}
+        </div>
+        <div className="approval-card__actions">
+          <button
+            type="button"
+            className="approval-card__btn approval-card__btn--allow"
+            disabled={!ready}
+            onClick={submit}
+          >
+            提交
+          </button>
+          <button type="button" className="approval-card__btn" onClick={onCancel}>
+            取消
           </button>
         </div>
       </div>

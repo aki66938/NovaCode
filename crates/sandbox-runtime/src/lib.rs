@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn workspace_auto_allows_workspace_file_tools() {
         let context = session_security_context(
-            "C:\\Users\\AIT\\Desktop\\NovaCode",
+            "C:\\workspace\\demo",
             PermissionMode::WorkspaceAuto,
             NetworkMode::Disabled,
         )
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn restricted_mode_denies_mutating_file_tools() {
         let context = session_security_context(
-            "C:\\Users\\AIT\\Desktop\\NovaCode",
+            "C:\\workspace\\demo",
             PermissionMode::Restricted,
             NetworkMode::Disabled,
         )
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn ask_every_time_allows_read_but_asks_for_mutations() {
         let context = session_security_context(
-            "C:\\Users\\AIT\\Desktop\\NovaCode",
+            "C:\\workspace\\demo",
             PermissionMode::AskEveryTime,
             NetworkMode::Disabled,
         )

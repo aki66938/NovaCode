@@ -1570,6 +1570,115 @@ h1 {
   border-color: var(--brand);
 }
 
+.approval-card__btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ── AskUserModal：Agent 结构化澄清提问 ── */
+
+.askuser-card {
+  width: min(520px, 92vw);
+  max-height: 82vh;
+}
+
+.askuser-questions {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  overflow-y: auto;
+}
+
+.askuser-question {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.askuser-question__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.askuser-chip {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--brand);
+  background: var(--brand-tint);
+  border: 1px solid var(--brand-tint-strong);
+  border-radius: var(--radius-tag);
+  padding: 2px 7px;
+}
+
+.askuser-question__text {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.askuser-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.askuser-option {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-btn);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  padding: 9px 12px;
+  transition: border-color 0.12s, background 0.12s;
+}
+
+.askuser-option:hover {
+  border-color: var(--brand);
+}
+
+.askuser-option--on {
+  border-color: var(--brand);
+  background: var(--brand-tint);
+}
+
+.askuser-option__label {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.askuser-option__desc {
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.askuser-other-input {
+  margin-top: 2px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-btn);
+  background: var(--surface-2);
+  color: var(--text);
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
+.askuser-other-input:focus {
+  outline: none;
+  border-color: var(--brand);
+}
+
+.askuser-multi-hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
 /* ── 更新提示横幅（固定在侧边栏底部） ── */
 
 .sidebar {

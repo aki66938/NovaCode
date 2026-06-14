@@ -794,12 +794,12 @@ mod tests {
         let db_path = std::env::temp_dir().join(format!("novacode-storage-{}.db", Uuid::new_v4()));
         let conn = init_db(&db_path).expect("db should initialize");
 
-        let first = save_active_workspace(&conn, "C:\\Users\\AIT\\Desktop\\NovaCode")
+        let first = save_active_workspace(&conn, "C:\\workspace\\demo")
             .expect("workspace should save");
-        assert_eq!(first.name, "NovaCode");
-        assert_eq!(first.path, "C:\\Users\\AIT\\Desktop\\NovaCode");
+        assert_eq!(first.name, "demo");
+        assert_eq!(first.path, "C:\\workspace\\demo");
 
-        let second = save_active_workspace(&conn, "C:\\Users\\AIT\\Desktop\\Other")
+        let second = save_active_workspace(&conn, "C:\\workspace\\other")
             .expect("workspace should replace");
         let loaded = get_active_workspace(&conn).expect("workspace should load");
 
@@ -819,16 +819,16 @@ mod tests {
 
         let conv = create_conversation_with_workspace(
             &conn,
-            Some("C:\\Users\\AIT\\Desktop\\NovaCode"),
+            Some("C:\\workspace\\demo"),
             Some("NovaCode"),
         )
         .expect("conversation should save workspace snapshot");
         let stored = list_conversations(&conn).expect("conversation should list");
 
-        assert_eq!(conv.workspace_path.as_deref(), Some("C:\\Users\\AIT\\Desktop\\NovaCode"));
+        assert_eq!(conv.workspace_path.as_deref(), Some("C:\\workspace\\demo"));
         assert_eq!(conv.workspace_name.as_deref(), Some("NovaCode"));
         assert_eq!(conv.mode, "local_workspace");
-        assert_eq!(stored[0].workspace_path.as_deref(), Some("C:\\Users\\AIT\\Desktop\\NovaCode"));
+        assert_eq!(stored[0].workspace_path.as_deref(), Some("C:\\workspace\\demo"));
 
         let _ = std::fs::remove_file(db_path);
     }
@@ -840,7 +840,7 @@ mod tests {
 
         let conv = create_conversation_with_workspace(
             &conn,
-            Some("C:\\Users\\AIT\\Desktop\\NovaCode"),
+            Some("C:\\workspace\\demo"),
             Some("NovaCode"),
         )
         .expect("conversation should save workspace snapshot");
@@ -849,7 +849,7 @@ mod tests {
             .expect("conversation should exist");
 
         assert_eq!(stored.id, conv.id);
-        assert_eq!(stored.workspace_path.as_deref(), Some("C:\\Users\\AIT\\Desktop\\NovaCode"));
+        assert_eq!(stored.workspace_path.as_deref(), Some("C:\\workspace\\demo"));
         assert_eq!(stored.workspace_name.as_deref(), Some("NovaCode"));
 
         let _ = std::fs::remove_file(db_path);

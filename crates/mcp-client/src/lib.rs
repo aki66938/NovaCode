@@ -43,6 +43,18 @@ pub struct McpToolDef {
     pub input_schema: serde_json::Value,
 }
 
+/// MCP server 暴露的资源定义（resources/list 返回项）。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct McpResource {
+    pub uri: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(rename = "mimeType", default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 /// HTTP worker 收到的一个请求作业。
 struct HttpJob {
     body: serde_json::Value,
@@ -207,6 +219,50 @@ impl McpClient {
         if is_error {
             return Err(McpError::ServerError(text));
         }
+        Ok(text)
+    }
+
+    /// 列出该 server 暴露的资源（resources/list）。server 不支持时返回错误。
+    pub fn list_resources(&self) -> Result<Vec<McpResource>, McpError> {
+        let result = self.request("resources/list", serde_json::json!({}), DEFAULT_CALL_TIMEOUT)?;
+        let resources = result
+            .get("resources")
+            .cloned()
+            .map(serde_json::from_value::<Vec<McpResource>>)
+            .transpose()
+            .map_err(|e| McpError::Io(e.to_string()))?
+            .unwrap_or_default();
+        Ok(resources)
+    }
+
+    /// 读取一个资源（resources/read），返回拼接后的文本内容；二进制 blob 以占位说明替代。
+    pub fn read_resource(&self, uri: &str) -> Result<String, McpError> {
+        let result = self.request(
+            "resources/read",
+            serde_json::json!({ "uri": uri }),
+            DEFAULT_CALL_TIMEOUT,
+        )?;
+        let text = result
+            .get("contents")
+            .and_then(|c| c.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        item.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| {
+                                item.get("blob")
+                                    .and_then(|b| b.as_str())
+                                    .map(|_| "[binary blob omitted]".to_string())
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
         Ok(text)
     }
 

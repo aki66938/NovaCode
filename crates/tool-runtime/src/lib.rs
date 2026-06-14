@@ -92,7 +92,7 @@ pub struct StatPathRequest {
     pub path: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchTextRequest {
     pub path: String,
@@ -102,6 +102,42 @@ pub struct SearchTextRequest {
     /// query 是否按正则解释；false 时按字面子串匹配。默认 false。
     #[serde(default)]
     pub is_regex: bool,
+    /// 输出模式：content（默认，匹配行+上下文）| files_with_matches（仅文件名）| count（每文件计数）。
+    #[serde(default)]
+    pub output_mode: Option<String>,
+    /// 大小写不敏感（-i）。
+    #[serde(default)]
+    pub case_insensitive: bool,
+    /// 跨行匹配：. 匹配换行、模式可跨行（regex (?s)）。
+    #[serde(default)]
+    pub multiline: bool,
+    /// 匹配行的前置上下文行数（-B）。
+    #[serde(default)]
+    pub before_context: usize,
+    /// 匹配行的后置上下文行数（-A）。
+    #[serde(default)]
+    pub after_context: usize,
+    /// 同时设置前后上下文行数（-C，优先于 before/after）。
+    #[serde(default)]
+    pub context: usize,
+    /// 按文件类型过滤（如 "rs"、"ts"、"py"），映射到扩展名集合。
+    #[serde(default)]
+    pub file_type: Option<String>,
+    /// 按文件名 glob 过滤（如 "*.rs"、"src/**"）。
+    #[serde(default)]
+    pub glob: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobFilesRequest {
+    /// 文件名 glob 模式：支持 * ? ** （如 "**/*.rs"、"src/**"、"*.toml"）。
+    pub pattern: String,
+    /// 起始相对目录，默认工作区根。
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default = "default_search_limit")]
+    pub max_results: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -214,11 +250,39 @@ pub struct DirEntry {
     pub bytes: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchTextResult {
     pub relative_path: String,
+    /// 实际生效的输出模式。
+    pub output_mode: String,
+    /// content 模式：匹配行（含可选上下文）。
+    #[serde(default)]
     pub matches: Vec<TextMatch>,
+    /// files_with_matches 模式：命中文件相对路径列表。
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// count 模式：每个文件的匹配行数。
+    #[serde(default)]
+    pub counts: Vec<FileMatchCount>,
+    /// 是否因达到 max_results 上限而截断。
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileMatchCount {
+    pub path: String,
+    pub count: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobFilesResult {
+    pub relative_path: String,
+    pub files: Vec<String>,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -249,12 +313,18 @@ pub struct RunCommandResult {
     pub duration_ms: u128,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextMatch {
     pub path: String,
     pub line: usize,
     pub preview: String,
+    /// 前置上下文行（-B/-C 时填充）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before: Vec<String>,
+    /// 后置上下文行（-A/-C 时填充）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -523,62 +593,307 @@ pub fn search_text(
         return Err(ToolRuntimeError::NotADirectory);
     }
 
-    let max_results = request.max_results.clamp(1, DEFAULT_SEARCH_LIMIT);
-    // 构建匹配器：正则或字面子串（字面时对 query 转义后整体作正则，统一走 regex 引擎）。
-    let pattern = if request.is_regex {
-        query.to_string()
-    } else {
-        regex::escape(query)
+    let output_mode = match request.output_mode.as_deref() {
+        Some("files_with_matches") => "files_with_matches",
+        Some("count") => "count",
+        _ => "content",
     };
+    // content 上限保守、files/count 可放宽（单条目轻量）。
+    let max_results = request.max_results.clamp(1, DEFAULT_SEARCH_LIMIT * 4);
+    let (before_ctx, after_ctx) = if request.context > 0 {
+        (request.context, request.context)
+    } else {
+        (request.before_context, request.after_context)
+    };
+
+    // 匹配器：字面/正则 + 大小写不敏感(i) + 跨行(s) 标志。
+    let mut pattern = if request.is_regex { query.to_string() } else { regex::escape(query) };
+    let mut flags = String::new();
+    if request.case_insensitive {
+        flags.push('i');
+    }
+    if request.multiline {
+        flags.push('s');
+    }
+    if !flags.is_empty() {
+        pattern = format!("(?{flags}){pattern}");
+    }
     let matcher = regex::Regex::new(&pattern)
         .map_err(|e| ToolRuntimeError::CommandFailed(format!("正则无效: {e}")))?;
 
-    // 用 ignore::WalkBuilder 做 gitignore 感知遍历（自动跳过 .gitignore 命中、.git、隐藏文件），
-    // 与 ripgrep 同源，速度快且不搜噪声目录。
-    let mut matches = Vec::new();
+    let exts = request.file_type.as_deref().map(file_type_extensions);
+    let glob = request.glob.as_deref().map(compile_glob).transpose()?;
+
+    let mut matches: Vec<TextMatch> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    let mut counts: Vec<FileMatchCount> = Vec::new();
+    let mut truncated = false;
+
     let walker = ignore::WalkBuilder::new(&target)
-        .hidden(true) // 跳过隐藏文件/目录
+        .hidden(true)
         .git_ignore(true)
         .git_global(false)
-        .require_git(false) // 即使工作区不是 git 仓库，也应用其中的 .gitignore
+        .require_git(false)
         .parents(true)
         .build();
     'walk: for entry in walker.flatten() {
-        if matches.len() >= max_results {
-            break;
-        }
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
-        // 跳过过大文件与二进制（非 UTF-8）
+        let rel = path
+            .strip_prefix(&target)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        // 文件类型 / glob 过滤
+        if let Some(exts) = &exts {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !exts.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+                continue;
+            }
+        }
+        if let Some(g) = &glob {
+            if !glob_hit(g, &rel) {
+                continue;
+            }
+        }
         let Ok(meta) = path.metadata() else { continue };
         if meta.len() > MAX_SEARCH_FILE_BYTES {
             continue;
         }
         let Ok(content) = std::fs::read_to_string(path) else { continue };
-        for (line_no, line) in content.lines().enumerate() {
-            if matcher.is_match(line) {
-                let rel = path
-                    .strip_prefix(&target)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                matches.push(TextMatch {
-                    path: rel,
-                    line: line_no + 1,
-                    preview: line.chars().take(200).collect(),
-                });
-                if matches.len() >= max_results {
+
+        if request.multiline {
+            // 跨行模式：在全文匹配，命中即视为该文件匹配；content 模式定位首个匹配起始行。
+            if matcher.is_match(&content) {
+                match output_mode {
+                    "files_with_matches" => files.push(rel.clone()),
+                    "count" => counts.push(FileMatchCount {
+                        path: rel.clone(),
+                        count: matcher.find_iter(&content).count(),
+                    }),
+                    _ => {
+                        if let Some(m) = matcher.find(&content) {
+                            let line_no = content[..m.start()].lines().count().max(1);
+                            let preview = content[m.start()..]
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .chars()
+                                .take(200)
+                                .collect();
+                            matches.push(TextMatch {
+                                path: rel.clone(),
+                                line: line_no,
+                                preview,
+                                before: Vec::new(),
+                                after: Vec::new(),
+                            });
+                        }
+                    }
+                }
+                let hit = match output_mode {
+                    "files_with_matches" => files.len() >= max_results,
+                    "count" => counts.len() >= max_results,
+                    _ => matches.len() >= max_results,
+                };
+                if hit {
+                    truncated = true;
                     break 'walk;
                 }
+            }
+            continue;
+        }
+
+        // 逐行模式
+        let lines: Vec<&str> = content.lines().collect();
+        let mut file_count = 0usize;
+        for (idx, line) in lines.iter().enumerate() {
+            if !matcher.is_match(line) {
+                continue;
+            }
+            file_count += 1;
+            match output_mode {
+                "content" => {
+                    let before = if before_ctx > 0 {
+                        lines[idx.saturating_sub(before_ctx)..idx]
+                            .iter()
+                            .map(|s| s.chars().take(200).collect())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let after = if after_ctx > 0 {
+                        let end = (idx + 1 + after_ctx).min(lines.len());
+                        lines[idx + 1..end]
+                            .iter()
+                            .map(|s| s.chars().take(200).collect())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    matches.push(TextMatch {
+                        path: rel.clone(),
+                        line: idx + 1,
+                        preview: line.chars().take(200).collect(),
+                        before,
+                        after,
+                    });
+                    if matches.len() >= max_results {
+                        truncated = true;
+                        break 'walk;
+                    }
+                }
+                "files_with_matches" => {
+                    files.push(rel.clone());
+                    if files.len() >= max_results {
+                        truncated = true;
+                        break 'walk;
+                    }
+                    break; // 该文件已记录，进入下一个文件
+                }
+                _ => {}
+            }
+        }
+        if output_mode == "count" && file_count > 0 {
+            counts.push(FileMatchCount { path: rel.clone(), count: file_count });
+            if counts.len() >= max_results {
+                truncated = true;
+                break 'walk;
             }
         }
     }
 
     Ok(SearchTextResult {
         relative_path: normalize_relative_path(&relative),
+        output_mode: output_mode.to_string(),
         matches,
+        files,
+        counts,
+        truncated,
+    })
+}
+
+/// 把 ripgrep 风格的 type 名映射到扩展名集合。
+fn file_type_extensions(t: &str) -> Vec<String> {
+    let owned = |arr: &[&str]| arr.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    match t.trim().to_ascii_lowercase().as_str() {
+        "rust" | "rs" => owned(&["rs"]),
+        "ts" | "typescript" => owned(&["ts", "tsx"]),
+        "js" | "javascript" => owned(&["js", "jsx", "mjs", "cjs"]),
+        "py" | "python" => owned(&["py"]),
+        "go" => owned(&["go"]),
+        "java" => owned(&["java"]),
+        "c" => owned(&["c", "h"]),
+        "cpp" | "c++" => owned(&["cpp", "cc", "cxx", "hpp", "hh"]),
+        "json" => owned(&["json"]),
+        "toml" => owned(&["toml"]),
+        "md" | "markdown" => owned(&["md", "markdown"]),
+        "css" => owned(&["css", "scss", "less"]),
+        "html" => owned(&["html", "htm"]),
+        "yaml" | "yml" => owned(&["yaml", "yml"]),
+        other => vec![other.to_string()],
+    }
+}
+
+/// 把 glob 模式（* ? **）编译为 (正则, 是否仅匹配 basename)。
+/// 不含 '/' 的模式按文件名匹配（如 "*.rs" 命中任意目录下的 .rs）；含 '/' 的按相对路径匹配。
+fn compile_glob(pattern: &str) -> Result<(regex::Regex, bool), ToolRuntimeError> {
+    let basename_only = !pattern.contains('/');
+    let re = regex::Regex::new(&glob_to_regex(pattern))
+        .map_err(|e| ToolRuntimeError::CommandFailed(format!("glob 无效: {e}")))?;
+    Ok((re, basename_only))
+}
+
+fn glob_to_regex(glob: &str) -> String {
+    let chars: Vec<char> = glob.chars().collect();
+    let mut re = String::from("^");
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => {
+                if i + 1 < chars.len() && chars[i + 1] == '*' {
+                    re.push_str(".*"); // ** 跨目录
+                    i += 1;
+                    if i + 1 < chars.len() && chars[i + 1] == '/' {
+                        i += 1;
+                    }
+                } else {
+                    re.push_str("[^/]*");
+                }
+            }
+            '?' => re.push_str("[^/]"),
+            c @ ('.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '[' | ']' | '\\') => {
+                re.push('\\');
+                re.push(c);
+            }
+            c => re.push(c),
+        }
+        i += 1;
+    }
+    re.push('$');
+    re
+}
+
+fn glob_hit(g: &(regex::Regex, bool), rel: &str) -> bool {
+    let target = if g.1 { rel.rsplit('/').next().unwrap_or(rel) } else { rel };
+    g.0.is_match(target)
+}
+
+/// 按文件名 glob 在工作区内快速枚举文件（gitignore 感知），返回相对路径（按修改时间倒序）。
+pub fn glob_files(
+    workspace_root: impl AsRef<Path>,
+    request: GlobFilesRequest,
+) -> Result<GlobFilesResult, ToolRuntimeError> {
+    let pattern = request.pattern.trim();
+    if pattern.is_empty() {
+        return Err(ToolRuntimeError::EmptyQuery);
+    }
+    let start = request.path.as_deref().filter(|p| !p.trim().is_empty()).unwrap_or(".");
+    let (_workspace, relative, target) = resolve_existing_path(workspace_root, start)?;
+    if !target.is_dir() {
+        return Err(ToolRuntimeError::NotADirectory);
+    }
+    let max_results = request.max_results.clamp(1, DEFAULT_SEARCH_LIMIT * 20);
+    let g = compile_glob(pattern)?;
+    let mut hits: Vec<(std::time::SystemTime, String)> = Vec::new();
+    let mut truncated = false;
+    let walker = ignore::WalkBuilder::new(&target)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(false)
+        .require_git(false)
+        .parents(true)
+        .build();
+    for entry in walker.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(&target)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !glob_hit(&g, &rel) {
+            continue;
+        }
+        let mtime = path
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        hits.push((mtime, rel));
+        if hits.len() > max_results {
+            truncated = true;
+        }
+    }
+    hits.sort_by(|a, b| b.0.cmp(&a.0));
+    hits.truncate(max_results);
+    Ok(GlobFilesResult {
+        relative_path: normalize_relative_path(&relative),
+        files: hits.into_iter().map(|(_, p)| p).collect(),
+        truncated,
     })
 }
 
@@ -1346,6 +1661,7 @@ mod tests {
                 query: "token".to_string(),
                 max_results: 10,
                 is_regex: false,
+                ..Default::default()
             },
         )
         .expect("text should search");
@@ -1364,11 +1680,90 @@ mod tests {
                 query: r"let \w+ =".to_string(),
                 max_results: 10,
                 is_regex: true,
+                ..Default::default()
             },
         )
         .expect("regex search");
         assert!(re.matches.iter().any(|m| m.path == "src/lib.rs"));
         assert!(!re.matches.iter().any(|m| m.path == "secret.txt"), "gitignore 命中应被跳过");
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn glob_files_matches_by_name_and_path() {
+        let workspace = temp_workspace();
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("src/lib.rs"), "x").unwrap();
+        std::fs::write(workspace.join("src/main.rs"), "x").unwrap();
+        std::fs::write(workspace.join("README.md"), "x").unwrap();
+
+        let rs = glob_files(
+            &workspace,
+            GlobFilesRequest { pattern: "*.rs".to_string(), max_results: 50, ..Default::default() },
+        )
+        .expect("glob should run");
+        assert_eq!(rs.files.len(), 2, "*.rs 应命中嵌套的两个 .rs");
+        assert!(rs.files.iter().all(|f| f.ends_with(".rs")));
+
+        let nested = glob_files(
+            &workspace,
+            GlobFilesRequest { pattern: "src/**".to_string(), max_results: 50, ..Default::default() },
+        )
+        .expect("glob should run");
+        assert!(nested.files.iter().any(|f| f == "src/lib.rs"));
+        assert!(!nested.files.iter().any(|f| f == "README.md"), "src/** 不应命中根级文件");
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn search_text_count_and_files_modes() {
+        let workspace = temp_workspace();
+        std::fs::write(workspace.join("a.txt"), "foo\nfoo\nbar").unwrap();
+        std::fs::write(workspace.join("b.txt"), "baz").unwrap();
+
+        let counts = search_text(
+            &workspace,
+            SearchTextRequest {
+                path: ".".to_string(),
+                query: "foo".to_string(),
+                max_results: 50,
+                output_mode: Some("count".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("count search");
+        assert_eq!(counts.output_mode, "count");
+        assert!(counts.counts.iter().any(|c| c.path == "a.txt" && c.count == 2));
+
+        let files = search_text(
+            &workspace,
+            SearchTextRequest {
+                path: ".".to_string(),
+                query: "foo".to_string(),
+                max_results: 50,
+                output_mode: Some("files_with_matches".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("files search");
+        assert_eq!(files.files, vec!["a.txt".to_string()]);
+
+        // 上下文行：-C 1 应带上下文。
+        let ctx = search_text(
+            &workspace,
+            SearchTextRequest {
+                path: ".".to_string(),
+                query: "bar".to_string(),
+                max_results: 50,
+                context: 1,
+                ..Default::default()
+            },
+        )
+        .expect("context search");
+        assert_eq!(ctx.matches.len(), 1);
+        assert_eq!(ctx.matches[0].before, vec!["foo".to_string()]);
 
         let _ = std::fs::remove_dir_all(workspace);
     }

@@ -21,10 +21,11 @@ use novacode_storage::{
 };
 use novacode_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
 use novacode_tool_runtime::{
-    create_file, delete_dir, delete_file, edit_file, list_dir, make_dir, move_path, read_file,
-    run_command, search_text, stat_path, write_file, CreateFileRequest, DeleteDirRequest,
-    DeleteFileRequest, EditFileRequest, ListDirRequest, MakeDirRequest, MovePathRequest,
-    ReadFileRequest, RunCommandRequest, SearchTextRequest, StatPathRequest, WriteFileRequest,
+    create_file, delete_dir, delete_file, edit_file, glob_files, list_dir, make_dir, move_path,
+    read_file, run_command, search_text, stat_path, write_file, CreateFileRequest, DeleteDirRequest,
+    DeleteFileRequest, EditFileRequest, GlobFilesRequest, ListDirRequest, MakeDirRequest,
+    MovePathRequest, ReadFileRequest, RunCommandRequest, SearchTextRequest, StatPathRequest,
+    WriteFileRequest,
 };
 
 /// Agent 工具循环单次会话内允许的最大工具轮数。作为防失控的硬上限兜底；
@@ -52,6 +53,8 @@ use tokio::sync::oneshot;
 
 /// 审批请求自增序号，用于生成唯一 action_id。
 static APPROVAL_SEQ: AtomicU64 = AtomicU64::new(1);
+/// ask_user 结构化提问自增序号，生成唯一 question_id。
+static QUESTION_SEQ: AtomicU64 = AtomicU64::new(1);
 
 // ── 应用状态 ──────────────────────────────────────────────────────────────
 
@@ -64,6 +67,9 @@ struct AppState {
     /// respond_approval 命令收到前端决定后，通过 oneshot 通道唤醒正在 await 的工具循环；
     /// 用户勾选记住时把规则写入 permission_rules 表。
     approvals: Mutex<HashMap<String, (oneshot::Sender<bool>, String)>>,
+    /// 等待用户回答的 ask_user 结构化提问，按 question_id 索引。respond_ask_user 命令收到
+    /// 前端选择后，通过 oneshot 通道把答案 JSON 回送给正在 await 的工具循环。
+    ask_questions: Mutex<HashMap<String, oneshot::Sender<String>>>,
     /// 已连接的 MCP server 客户端，按配置 id 索引。Arc 包裹以便在锁外调用。
     mcp: Mutex<HashMap<String, Arc<McpClient>>>,
     /// Steering：用户在 Agent 运行中排队的插话消息，按 conversation_id 索引。
@@ -74,6 +80,9 @@ struct AppState {
     repo_maps: Mutex<HashMap<String, String>>,
     /// 托管后台 shell：background=true 启动的命令，按 shell_id 索引，可轮询输出 / 杀进程。
     bg_shells: Mutex<HashMap<String, BgShell>>,
+    /// 后台子代理任务：run_subtask background=true 启动的探索代理，按 task_id 索引，
+    /// 可用 get_task_output 轮询报告/状态、kill_task 终止；完成时 usage 由首次 get_task_output 结算进账本。
+    bg_tasks: Mutex<HashMap<String, BgTask>>,
     /// 命令沙箱开关（默认开）：前台 run_command 是否在受限令牌沙箱中执行。
     command_sandbox: AtomicBool,
     /// 单次任务 token 预算（累计 total_tokens 上限）；0 = 不限。超出则暂停工具循环。
@@ -91,6 +100,21 @@ struct BgShell {
 
 /// 后台 shell 自增序号，生成唯一 shell_id。
 static BG_SHELL_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// 一个后台子代理任务的共享状态（仿 BgShell）。
+#[derive(Clone)]
+struct BgTask {
+    description: String,
+    report: Arc<Mutex<String>>,
+    status: Arc<Mutex<String>>, // running | done | killed | error
+    usage: Arc<Mutex<Option<novacode_shared::RawUsage>>>,
+    /// usage 是否已被某次 get_task_output 结算进会话账本，避免重复计费。
+    settled: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+}
+
+/// 后台子代理任务自增序号，生成唯一 task_id。
+static BG_TASK_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// MCP 工具与模型函数名的绑定关系，按 send 周期收集后传入工具循环。
 #[derive(Clone)]
@@ -1010,6 +1034,24 @@ fn respond_approval(
     Ok(())
 }
 
+/// 前端对一次 ask_user 结构化提问作出回应，把答案 JSON（已含用户选择 / 自定义文本）
+/// 通过 question_id 对应的 oneshot 通道送回正在等待的工具循环。
+#[tauri::command]
+fn respond_ask_user(
+    state: State<AppState>,
+    question_id: String,
+    answer: String,
+) -> Result<(), String> {
+    let sender = {
+        let mut map = state.ask_questions.lock().map_err(|e| e.to_string())?;
+        map.remove(&question_id)
+    };
+    if let Some(sender) = sender {
+        let _ = sender.send(answer);
+    }
+    Ok(())
+}
+
 // ── 工作区管理 ─────────────────────────────────────────────────────────────
 
 /// 返回当前用户授权的活动工作区。
@@ -1133,7 +1175,7 @@ fn messages_with_workspace_context(
     // 身份锚定：明确 NovaCode 不是 Claude Code，配置在 .novacode/，防止模型沿用 .claude 等训练记忆里的约定。
     injected.push(ChatMessage {
         role: "system".to_string(),
-        content: "你是 NovaCode 桌面 Agent 的内置助手，运行在 NovaCode 应用里（NovaCode 的理念是「Ignite the Spark, Unleash the Code.」，一个本地优先、为国产大模型定制的编码客户端）。\
+        content: "你是 NovaCode（Ignite the Spark, Unleash the Code.）桌面 Agent 的内置助手，运行在 NovaCode 应用里。\
 你不是 Claude Code，也不是 Codex，不要沿用它们的约定：本应用的配置目录是工作区下的 .novacode/（不是 .claude/，NovaCode 没有也不读取 .claude 目录及其中的 settings.json）。\
 NovaCode 的可扩展配置都在 .novacode/ 下：技能 .novacode/skills/<名>/SKILL.md，钩子 .novacode/hooks.json，自定义斜杠命令 .novacode/commands/<名>.md，自定义子代理 .novacode/agents/<类型>.md，诊断命令 .novacode/diagnostics；项目长期记忆是工作区根目录的 NovaCode.md。\
 安装/配置 MCP 服务器不是通过编辑任何配置文件——请调用 add_mcp_server 工具注册（它会写入 NovaCode 的服务器表并立即连接、其工具随后即可调用），或让用户在「设置 → MCP 服务器」添加。绝不要去查找或编辑 .claude/settings.json 之类文件，那对 NovaCode 完全无效。".to_string(),
@@ -1151,7 +1193,7 @@ create_file、write_file 或 delete_file 工具完成真实本地操作；不要
     });
     injected.push(ChatMessage {
         role: "system".to_string(),
-        content: "工具调用规则：所有本地文件和命令操作必须通过工具完成，不能只在正文中声称已经完成。可用工具包括 list_dir、read_file、create_file、write_file、edit_file、delete_file、make_dir、move_path、delete_dir、stat_path、search_text、run_command。修改已有文件时优先使用 edit_file，并提供 oldText/newText；只有需要完整覆盖文件时才使用 write_file。移动或重命名文件用 move_path，不要用 create+delete 模拟。执行前需要了解目录、文件存在性或代码位置时，先使用 list_dir、stat_path 或 search_text。run_command 用于列目录、git status、构建或测试等命令：低风险命令（cargo check/test、npm test/run build、git status/diff、dir 等）在 Workspace Auto 下可直接执行，其余命令需 Full Access 或用户审批。每一步都要基于真实工具结果继续；若某次工具因权限被拒绝或用户拒绝，应说明情况或改用被允许的方式，不要重复硬闯。若某次工具调用失败，请阅读返回的 error，判断是参数、路径还是环境问题，调整后重试或换用其他工具，不要原样重复同一次失败调用。对于多步骤任务，请先调用 todo_write 列出步骤清单并随进度更新状态（同一时刻只有一项 in_progress），让用户实时看到进度。需要在大型代码库做只读调查（找实现、理结构、读懂模块）时，优先调用 run_subtask 委托独立子代理，避免主对话上下文膨胀。长时间运行的命令（启动服务、watch 等）用 run_command 的 background=true，它会立即返回 shellId；之后用 get_shell_output 轮询其输出与状态、用 kill_shell 终止、用 list_shells 查看所有后台进程。用户消息中的 @相对路径 表示工作区文件引用，直接用 read_file 读取即可。需要查阅在线文档、报错信息或你不确定的最新资料时，用 web_search 搜索、再用 web_fetch 抓取相关 URL 的正文，不要凭记忆臆测。遇到值得跨会话记住的项目约定、关键路径或踩过的坑，用 remember 写入项目长期记忆（精炼、可复用的事实才记，临时细节不要记）。".to_string(),
+        content: "工具调用规则：所有本地文件和命令操作必须通过工具完成，不能只在正文中声称已经完成。可用工具包括 list_dir、read_file、create_file、write_file、edit_file、delete_file、make_dir、move_path、delete_dir、stat_path、search_text、run_command。修改已有文件时优先使用 edit_file，并提供 oldText/newText；只有需要完整覆盖文件时才使用 write_file。移动或重命名文件用 move_path，不要用 create+delete 模拟。执行前需要了解目录、文件存在性或代码位置时，先使用 list_dir、stat_path 或 search_text。run_command 用于列目录、git status、构建或测试等命令：低风险命令（cargo check/test、npm test/run build、git status/diff、dir 等）在 Workspace Auto 下可直接执行，其余命令需 Full Access 或用户审批。每一步都要基于真实工具结果继续；若某次工具因权限被拒绝或用户拒绝，应说明情况或改用被允许的方式，不要重复硬闯。若某次工具调用失败，请阅读返回的 error，判断是参数、路径还是环境问题，调整后重试或换用其他工具，不要原样重复同一次失败调用。对于多步骤任务，请先调用 todo_write 列出步骤清单并随进度更新状态（同一时刻只有一项 in_progress），让用户实时看到进度。当需求确实含糊、且靠读文件或运行工具也无法判断、继续就会做错方向时，用 ask_user 给出 1-4 个结构化选项让用户选择，而不是擅自假设；能自己查清的事不要问。需要在大型代码库做只读调查（找实现、理结构、读懂模块）时，优先调用 run_subtask 委托独立子代理，避免主对话上下文膨胀。长时间运行的命令（启动服务、watch 等）用 run_command 的 background=true，它会立即返回 shellId；之后用 get_shell_output 轮询其输出与状态、用 kill_shell 终止、用 list_shells 查看所有后台进程。用户消息中的 @相对路径 表示工作区文件引用，直接用 read_file 读取即可。需要查阅在线文档、报错信息或你不确定的最新资料时，用 web_search 搜索、再用 web_fetch 抓取相关 URL 的正文，不要凭记忆臆测。遇到值得跨会话记住的项目约定、关键路径或踩过的坑，用 remember 写入项目长期记忆（精炼、可复用的事实才记，临时细节不要记）。".to_string(),
     });
     // repo map：开局注入工作区结构摘要，让模型无需逐层 list_dir 就了解项目骨架。
     if let Some(map) = repo_map.filter(|map| !map.trim().is_empty()) {
@@ -1441,6 +1483,61 @@ async fn request_tool_approval(app: &AppHandle, tool_name: &str, arguments: &str
     );
 
     receiver.await.unwrap_or(false)
+}
+
+/// 生成唯一 question_id，注册 oneshot 通道，emit "ask-user-request"（携带结构化问题），
+/// 然后 await 前端通过 respond_ask_user 命令送回的答案 JSON。通道异常 / 用户取消时返回空串。
+async fn request_user_answer(app: &AppHandle, questions: &serde_json::Value) -> String {
+    let question_id = format!("ask-{}", QUESTION_SEQ.fetch_add(1, Ordering::SeqCst));
+    let (sender, receiver) = oneshot::channel::<String>();
+    {
+        let state = app.state::<AppState>();
+        let mut map = state
+            .ask_questions
+            .lock()
+            .expect("ask_questions mutex poisoned");
+        map.insert(question_id.clone(), sender);
+    }
+
+    let _ = app.emit(
+        "ask-user-request",
+        serde_json::json!({
+            "questionId": question_id,
+            "questions": questions,
+        }),
+    );
+
+    receiver.await.unwrap_or_default()
+}
+
+/// ask_user 工具：需求不明确且靠读文件 / 工具也无法判断时，把 1-4 个结构化问题弹给用户，
+/// 阻塞等待选择（前端自动附「Other」自定义项），返回用户答案 JSON 供模型据此继续。
+async fn execute_ask_user(
+    app: &AppHandle,
+    arguments: &str,
+) -> Result<serde_json::Value, String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(arguments)
+        .map_err(|err| format!("工具参数解析失败: {err}"))?;
+    let questions = parsed
+        .get("questions")
+        .cloned()
+        .ok_or_else(|| "ask_user 缺少 questions".to_string())?;
+    let is_nonempty_array = questions
+        .as_array()
+        .map(|a| !a.is_empty() && a.len() <= 4)
+        .unwrap_or(false);
+    if !is_nonempty_array {
+        return Err("ask_user 的 questions 必须是 1-4 个问题的数组".to_string());
+    }
+
+    let answer = request_user_answer(app, &questions).await;
+    if answer.trim().is_empty() {
+        return Err("用户未作出选择（已取消提问）。请根据已有信息继续，或换一种方式推进。".to_string());
+    }
+    // 前端回送的是答案 JSON（每题 -> 选择数组 / 自定义文本）；解析失败则按纯文本兜底。
+    let answers = serde_json::from_str::<serde_json::Value>(&answer)
+        .unwrap_or(serde_json::Value::String(answer));
+    Ok(serde_json::json!({ "answers": answers }))
 }
 
 /// 从工具参数中提取审批展示用的目标（path / from / command）。
@@ -1991,7 +2088,7 @@ fn html_to_text(html: &str) -> String {
 
 /// 可并行执行的只读工具集合（无副作用，并发安全）。
 const PARALLEL_READONLY_TOOLS: &[&str] =
-    &["read_file", "list_dir", "search_text", "stat_path", "web_fetch", "web_search"];
+    &["read_file", "list_dir", "search_text", "glob_files", "stat_path", "web_fetch", "web_search"];
 
 /// 执行一个只读工具调用（同步文件工具或异步 web 工具），供并行批量执行。
 async fn execute_readonly_call(
@@ -2321,7 +2418,7 @@ fn execute_bg_shell_tool(
 
 /// 子任务探索代理可用的只读工具集合。
 fn read_only_tool_schemas() -> Vec<serde_json::Value> {
-    const READ_ONLY: &[&str] = &["list_dir", "read_file", "search_text", "stat_path"];
+    const READ_ONLY: &[&str] = &["list_dir", "read_file", "search_text", "glob_files", "stat_path"];
     all_builtin_tool_schemas()
         .into_iter()
         .filter(|schema| {
@@ -2366,19 +2463,114 @@ async fn execute_run_subtask(
         });
     let system_prompt = match custom_agent {
         Some(def) => format!(
-            "你是一个只读探索子代理，工作区路径是 {workspace_path}。你只能使用 list_dir、read_file、search_text、stat_path 这些只读工具，禁止写入或命令执行。以下是你的角色定义：\n{def}\n完成后输出简明中文报告。"
+            "你是一个只读探索子代理，工作区路径是 {workspace_path}。你只能使用 list_dir、read_file、search_text、glob_files、stat_path 这些只读工具，禁止写入或命令执行。以下是你的角色定义：\n{def}\n完成后输出简明中文报告。"
         ),
         None => format!(
-            "你是一个只读探索子代理，工作区路径是 {workspace_path}。你只能使用 list_dir、read_file、search_text、stat_path 这些只读工具调查代码与文件，禁止任何写入或命令执行。完成调查后，输出一份简明、信息密度高的中文报告，直接回答委托内容，不要寒暄。"
+            "你是一个只读探索子代理，工作区路径是 {workspace_path}。你只能使用 list_dir、read_file、search_text、glob_files、stat_path 这些只读工具调查代码与文件，禁止任何写入或命令执行。完成调查后，输出一份简明、信息密度高的中文报告，直接回答委托内容，不要寒暄。"
         ),
     };
+
+    let background = parsed.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
+    if background {
+        // 注册后台任务并 spawn 独立 loop；立即返回 taskId，主循环不等待。
+        let task_id = format!("task-{}", BG_TASK_SEQ.fetch_add(1, Ordering::SeqCst));
+        let report = Arc::new(Mutex::new(String::new()));
+        let status = Arc::new(Mutex::new("running".to_string()));
+        let usage_slot: Arc<Mutex<Option<novacode_shared::RawUsage>>> = Arc::new(Mutex::new(None));
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let st = app.state::<AppState>();
+            let mut tasks = st.bg_tasks.lock().expect("bg_tasks mutex poisoned");
+            tasks.insert(
+                task_id.clone(),
+                BgTask {
+                    description: description.to_string(),
+                    report: report.clone(),
+                    status: status.clone(),
+                    usage: usage_slot.clone(),
+                    settled: Arc::new(AtomicBool::new(false)),
+                    cancel: cancel.clone(),
+                },
+            );
+        }
+        let api_key = api_key.to_string();
+        let model = model.to_string();
+        let workspace_owned = workspace_path.to_string();
+        let conversation_owned = conversation_id.to_string();
+        let description_owned = description.to_string();
+        let app_bg = app.clone();
+        let task_id_done = task_id.clone();
+        tauri::async_runtime::spawn(async move {
+            let (text, sub_usage) = run_subtask_loop(
+                &api_key,
+                &model,
+                &workspace_owned,
+                &system_prompt,
+                &description_owned,
+                &app_bg,
+                &conversation_owned,
+                Some(cancel.clone()),
+            )
+            .await;
+            let final_status = if cancel.load(Ordering::SeqCst) { "killed" } else { "done" };
+            if let Ok(mut r) = report.lock() {
+                *r = text;
+            }
+            if let Ok(mut u) = usage_slot.lock() {
+                *u = sub_usage;
+            }
+            if let Ok(mut s) = status.lock() {
+                *s = final_status.to_string();
+            }
+            let _ = app_bg.emit(
+                "background-task-done",
+                serde_json::json!({ "taskId": task_id_done, "status": final_status }),
+            );
+        });
+        return (
+            Ok(serde_json::json!({
+                "background": true,
+                "taskId": task_id,
+                "note": "子代理已在后台启动。用 get_task_output 轮询报告/状态、kill_task 终止；你无需等待，继续后续步骤。"
+            })),
+            None,
+        );
+    }
+
+    // 前台：同步等待子代理 loop 完成，usage 并入当轮账本。
+    let (report, usage) = run_subtask_loop(
+        api_key,
+        model,
+        workspace_path,
+        &system_prompt,
+        description,
+        app,
+        conversation_id,
+        None,
+    )
+    .await;
+    (Ok(serde_json::json!({ "report": report })), usage)
+}
+
+/// 子代理工具循环主体（前台/后台共用）。后台模式下每轮检查 cancel 以支持 kill_task。
+#[allow(clippy::too_many_arguments)]
+async fn run_subtask_loop(
+    api_key: &str,
+    model: &str,
+    workspace_path: &str,
+    system_prompt: &str,
+    description: &str,
+    app: &AppHandle,
+    conversation_id: &str,
+    cancel: Option<Arc<AtomicBool>>,
+) -> (String, Option<novacode_shared::RawUsage>) {
     let security_context = match session_security_context(
         workspace_path.to_string(),
         PermissionMode::Restricted,
         NetworkMode::Disabled,
     ) {
         Ok(ctx) => ctx,
-        Err(e) => return (Err(e.to_string()), None),
+        Err(e) => return (format!("子代理初始化失败: {e}"), None),
     };
 
     let mut wire = vec![
@@ -2389,6 +2581,9 @@ async fn execute_run_subtask(
     let mut report = String::new();
 
     for _ in 0..SUBTASK_MAX_ROUNDS {
+        if cancel.as_ref().map(|c| c.load(Ordering::SeqCst)).unwrap_or(false) {
+            break;
+        }
         let completion = match chat_completion_with_retry(
             api_key,
             wire.clone(),
@@ -2399,7 +2594,7 @@ async fn execute_run_subtask(
         .await
         {
             Ok(result) => result,
-            Err(e) => return (Err(e), usage),
+            Err(e) => return (format!("子代理出错: {e}"), usage),
         };
         usage = merge_usage(usage, completion.usage.clone());
 
@@ -2440,8 +2635,10 @@ async fn execute_run_subtask(
                 None,
                 workspace_path,
             );
-            let result = if matches!(name, "list_dir" | "read_file" | "search_text" | "stat_path")
-            {
+            let result = if matches!(
+                name,
+                "list_dir" | "read_file" | "search_text" | "glob_files" | "stat_path"
+            ) {
                 execute_builtin_tool_call(&security_context, name, &call.function.arguments)
             } else {
                 Err("子任务仅允许只读工具".to_string())
@@ -2482,8 +2679,188 @@ async fn execute_run_subtask(
         report = "（子任务在限定轮数内未给出报告）".to_string();
     }
     let capped: String = report.chars().take(8_000).collect();
-    (Ok(serde_json::json!({ "report": capped })), usage)
+    (capped, usage)
 }
+
+/// MCP 资源工具：list_mcp_resources / read_mcp_resource，从 AppState 已连接客户端读取。
+fn execute_mcp_resource_tool(
+    app: &AppHandle,
+    tool_name: &str,
+    arguments: &str,
+) -> Result<serde_json::Value, String> {
+    let parsed: serde_json::Value = serde_json::from_str(arguments).unwrap_or(serde_json::json!({}));
+    // 克隆 (name, Arc<McpClient>) 到锁外，避免持锁阻塞期间调用网络。
+    let clients: Vec<Arc<McpClient>> = {
+        let st = app.state::<AppState>();
+        let guard = st.mcp.lock().map_err(|e| e.to_string())?;
+        guard.values().cloned().collect()
+    };
+    match tool_name {
+        "list_mcp_resources" => {
+            let filter = parsed.get("server").and_then(|v| v.as_str());
+            let mut out = Vec::new();
+            for client in &clients {
+                if let Some(f) = filter {
+                    if client.server_name != f {
+                        continue;
+                    }
+                }
+                // server 不支持 resources 时返回错误，跳过即可。
+                if let Ok(resources) = client.list_resources() {
+                    for r in resources {
+                        out.push(serde_json::json!({
+                            "server": client.server_name,
+                            "uri": r.uri,
+                            "name": r.name,
+                            "mimeType": r.mime_type,
+                            "description": r.description,
+                        }));
+                    }
+                }
+            }
+            Ok(serde_json::json!({ "resources": out }))
+        }
+        "read_mcp_resource" => {
+            let server = parsed
+                .get("server")
+                .and_then(|v| v.as_str())
+                .ok_or("read_mcp_resource 缺少 server")?;
+            let uri = parsed
+                .get("uri")
+                .and_then(|v| v.as_str())
+                .ok_or("read_mcp_resource 缺少 uri")?;
+            let client = clients
+                .iter()
+                .find(|c| c.server_name == server)
+                .ok_or_else(|| format!("未找到已连接的 MCP server: {server}"))?;
+            let text = client.read_resource(uri).map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "server": server, "uri": uri, "content": text }))
+        }
+        other => Err(format!("未知 MCP 资源工具: {other}")),
+    }
+}
+
+/// 后台子代理任务工具：get_task_output / kill_task / list_tasks。
+/// get_task_output 在任务完成且未结算时返回其 usage，供主循环并入会话账本（只结算一次）。
+async fn execute_bg_task_tool(
+    app: &AppHandle,
+    tool_name: &str,
+    arguments: &str,
+) -> (Result<serde_json::Value, String>, Option<novacode_shared::RawUsage>) {
+    let parsed: serde_json::Value = serde_json::from_str(arguments).unwrap_or(serde_json::json!({}));
+    match tool_name {
+        "list_tasks" => {
+            let st = app.state::<AppState>();
+            let list: Vec<serde_json::Value> = match st.bg_tasks.lock() {
+                Ok(tasks) => tasks
+                    .iter()
+                    .map(|(id, t)| {
+                        serde_json::json!({
+                            "taskId": id,
+                            "description": t.description,
+                            "status": t.status.lock().map(|s| s.clone()).unwrap_or_default(),
+                        })
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            (Ok(serde_json::json!({ "tasks": list })), None)
+        }
+        "kill_task" => {
+            let Some(id) = parsed.get("taskId").and_then(|v| v.as_str()) else {
+                return (Err("kill_task 缺少 taskId".to_string()), None);
+            };
+            let st = app.state::<AppState>();
+            let cancel = st.bg_tasks.lock().ok().and_then(|t| t.get(id).map(|t| t.cancel.clone()));
+            match cancel {
+                Some(cancel) => {
+                    cancel.store(true, Ordering::SeqCst);
+                    (
+                        Ok(serde_json::json!({ "taskId": id, "note": "已请求终止该后台子代理" })),
+                        None,
+                    )
+                }
+                None => (Err(format!("taskId 不存在: {id}")), None),
+            }
+        }
+        "get_task_output" => {
+            let Some(id) = parsed.get("taskId").and_then(|v| v.as_str()) else {
+                return (Err("get_task_output 缺少 taskId".to_string()), None);
+            };
+            let block = parsed.get("block").and_then(|v| v.as_bool()).unwrap_or(false);
+            let timeout_secs = parsed
+                .get("timeoutSecs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(30)
+                .min(120);
+
+            let task = {
+                let st = app.state::<AppState>();
+                st.bg_tasks.lock().ok().and_then(|t| t.get(id).cloned())
+            };
+            let Some(task) = task else {
+                return (Err(format!("taskId 不存在: {id}")), None);
+            };
+
+            if block {
+                let deadline_ms = timeout_secs * 1000;
+                let mut waited = 0u64;
+                loop {
+                    let running = task.status.lock().map(|s| *s == "running").unwrap_or(false);
+                    if !running || waited >= deadline_ms {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    waited += 500;
+                }
+            }
+
+            let status = task.status.lock().map(|s| s.clone()).unwrap_or_default();
+            let report = task.report.lock().map(|r| r.clone()).unwrap_or_default();
+            // 完成且未结算：取出 usage 并入账本（swap 保证只结算一次）。
+            let settled_usage = if status != "running" && !task.settled.swap(true, Ordering::SeqCst) {
+                task.usage.lock().ok().and_then(|u| u.clone())
+            } else {
+                None
+            };
+            (
+                Ok(serde_json::json!({ "taskId": id, "status": status, "report": report })),
+                settled_usage,
+            )
+        }
+        other => (Err(format!("未知后台任务工具: {other}")), None),
+    }
+}
+
+/// 工具结果过大时落盘到 .novacode/tool-results/<seq>.txt，返回给模型的省流摘要（含相对路径 + 开头预览，
+/// 完整内容可用 read_file 分页读取）；未超阈值则原样返回。落盘失败退回原文，绝不丢内容。
+fn maybe_persist_large_output(workspace_path: &str, output_str: &str) -> String {
+    const LARGE_OUTPUT_THRESHOLD: usize = 16_000;
+    if output_str.chars().count() <= LARGE_OUTPUT_THRESHOLD {
+        return output_str.to_string();
+    }
+    let seq = LARGE_OUTPUT_SEQ.fetch_add(1, Ordering::SeqCst);
+    let rel = format!(".novacode/tool-results/{seq}.txt");
+    let dir = std::path::Path::new(workspace_path).join(".novacode").join("tool-results");
+    let full = dir.join(format!("{seq}.txt"));
+    let bytes = output_str.len();
+    let head: String = output_str.chars().take(2_000).collect();
+    if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&full, output_str).is_ok() {
+        serde_json::json!({
+            "ok": true,
+            "note": format!("工具输出过大（约 {bytes} 字节），已落盘以节省上下文。如需完整内容，用 read_file 读取 persistedPath（支持 offset/limit 分页）。"),
+            "persistedPath": rel,
+            "bytes": bytes,
+            "head": head
+        })
+        .to_string()
+    } else {
+        output_str.to_string()
+    }
+}
+
+/// 大工具输出落盘自增序号。
+static LARGE_OUTPUT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// 读取上下文压缩软上限：优先取环境变量 NOVACODE_CONTEXT_SOFT_LIMIT（便于低阈值压测），否则用默认值。
 fn context_soft_limit_tokens() -> u64 {
@@ -2973,7 +3350,7 @@ async fn chat_with_builtin_tools(
                     Some(&output_str), error.as_deref(), workspace_path,
                 );
                 wire_messages.push(serde_json::json!({
-                    "role": "tool", "tool_call_id": call.id, "content": output_str
+                    "role": "tool", "tool_call_id": call.id, "content": maybe_persist_large_output(workspace_path, &output_str)
                 }));
             }
             continue;
@@ -3059,6 +3436,7 @@ async fn chat_with_builtin_tools(
             } else {
                 match tool_name.as_str() {
                 "todo_write" => execute_todo_write(app, &arguments),
+                "ask_user" => execute_ask_user(app, &arguments).await,
                 "load_skill" => execute_load_skill(workspace_path, &arguments),
                 "remember" => execute_remember(workspace_path, &arguments),
                 "add_mcp_server" => execute_add_mcp_server(app, &arguments),
@@ -3084,6 +3462,15 @@ async fn chat_with_builtin_tools(
                     .await;
                     usage = merge_usage(usage, sub_usage);
                     sub_result
+                }
+                "list_mcp_resources" | "read_mcp_resource" => {
+                    execute_mcp_resource_tool(app, &tool_name, &arguments)
+                }
+                "get_task_output" | "kill_task" | "list_tasks" => {
+                    let (task_result, task_usage) =
+                        execute_bg_task_tool(app, &tool_name, &arguments).await;
+                    usage = merge_usage(usage, task_usage);
+                    task_result
                 }
                 _ => execute_builtin_tool_call(&security_context, &tool_name, &arguments),
                 }
@@ -3135,7 +3522,7 @@ async fn chat_with_builtin_tools(
             wire_messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": call.id,
-                "content": output_str
+                "content": maybe_persist_large_output(workspace_path, &output_str)
             }));
 
             // PostToolUse 钩子：工具成功后运行用户定义的后处理（如自动格式化 / 跑测试），信息性不阻断。
@@ -3235,11 +3622,49 @@ fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
             "Return whether a relative workspace path exists and whether it is a file or directory.",
             &["path"],
         ),
-        file_tool_schema(
-            "search_text",
-            "Search UTF-8 text files recursively inside a workspace directory. Gitignore-aware (ripgrep-style): skips ignored and hidden files. Supports regex via isRegex.",
-            &["path", "query"],
-        ),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "search_text",
+                "description": "Search file CONTENTS recursively inside a workspace directory (ripgrep-style, gitignore-aware, skips hidden/ignored files). Use this to find where text/code appears. For finding files by NAME/path pattern, use glob_files instead.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative directory to search in (e.g. \".\" for workspace root)." },
+                        "query": { "type": "string", "description": "Search pattern (literal substring, or regex when isRegex=true)." },
+                        "isRegex": { "type": "boolean", "description": "Interpret query as a regular expression. Default false." },
+                        "outputMode": { "type": "string", "enum": ["content", "files_with_matches", "count"], "description": "content = matching lines (default); files_with_matches = just file paths; count = matches per file." },
+                        "caseInsensitive": { "type": "boolean", "description": "Case-insensitive match (-i). Default false." },
+                        "multiline": { "type": "boolean", "description": "Allow the pattern to span lines (. matches newlines). Default false." },
+                        "context": { "type": "integer", "description": "Lines of context before AND after each match (-C). content mode only." },
+                        "beforeContext": { "type": "integer", "description": "Lines of context before each match (-B). content mode only." },
+                        "afterContext": { "type": "integer", "description": "Lines of context after each match (-A). content mode only." },
+                        "fileType": { "type": "string", "description": "Restrict to a file type, e.g. \"rs\", \"ts\", \"py\", \"json\"." },
+                        "glob": { "type": "string", "description": "Restrict to files whose name/path matches this glob, e.g. \"*.rs\" or \"src/**\"." },
+                        "maxResults": { "type": "integer", "description": "Cap on returned matches/files/counts." }
+                    },
+                    "required": ["path", "query"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "glob_files",
+                "description": "Find files by NAME/path glob pattern inside the workspace (gitignore-aware), returned newest-first. Use this to locate files (e.g. all \"*.rs\", everything under \"src/**\") rather than searching their contents.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Glob: supports * ? and ** (e.g. \"**/*.rs\", \"src/**\", \"*.toml\"). A pattern without \"/\" matches by file name in any directory." },
+                        "path": { "type": "string", "description": "Relative directory to start from. Defaults to workspace root." },
+                        "maxResults": { "type": "integer", "description": "Cap on returned file paths." }
+                    },
+                    "required": ["pattern"],
+                    "additionalProperties": false
+                }
+            }
+        }),
         serde_json::json!({
             "type": "function",
             "function": {
@@ -3342,6 +3767,45 @@ fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "type": "function",
             "function": {
+                "name": "ask_user",
+                "description": "Ask the user 1-4 structured multiple-choice questions when requirements are genuinely ambiguous and guessing would risk doing the wrong work. The UI renders clickable option cards; an 'Other' free-text choice is always added automatically, and questions can allow multiple selections. Prefer this over assuming. Do NOT use it for anything you can determine yourself by reading files or running tools — only for real decisions that are the user's to make.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "questions": {
+                            "type": "array",
+                            "description": "1 to 4 questions to ask at once.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "question": { "type": "string", "description": "The full, specific question, ending with a question mark." },
+                                    "header": { "type": "string", "description": "Very short label (<= 12 chars) shown as a chip, e.g. 'Library', 'Approach'." },
+                                    "multiSelect": { "type": "boolean", "description": "Allow selecting multiple options. Defaults to false." },
+                                    "options": {
+                                        "type": "array",
+                                        "description": "2 to 4 mutually-exclusive choices ('Other' is added automatically; do not add it yourself).",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "label": { "type": "string", "description": "Concise option text (1-5 words)." },
+                                                "description": { "type": "string", "description": "What this option means or implies (trade-offs)." }
+                                            },
+                                            "required": ["label"]
+                                        }
+                                    }
+                                },
+                                "required": ["question", "options"]
+                            }
+                        }
+                    },
+                    "required": ["questions"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
                 "name": "load_skill",
                 "description": "Load the full instructions of a workspace skill (from .novacode/skills/<name>/SKILL.md). Call this when the available-skills list (in system context) has a skill matching the current task.",
                 "parameters": {
@@ -3420,14 +3884,78 @@ fn all_builtin_tool_schemas() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "run_subtask",
-                "description": "Delegate a focused READ-ONLY exploration subtask (e.g. 'find where X is implemented', 'summarize how module Y works') to a sub-agent with its own fresh context. The sub-agent can only list/read/search files and returns a concise text report. Use this to investigate large codebases without bloating the main conversation. Optionally set agentType to use a custom agent role from .novacode/agents/<type>.md.",
+                "description": "Delegate a focused READ-ONLY exploration subtask (e.g. 'find where X is implemented', 'summarize how module Y works') to a sub-agent with its own fresh context. The sub-agent can only list/read/search files and returns a concise text report. Use this to investigate large codebases without bloating the main conversation. Optionally set agentType to use a custom agent role from .novacode/agents/<type>.md. Set background=true to run it asynchronously: it returns a taskId immediately so you can keep working; poll progress with get_task_output and stop it with kill_task.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "description": { "type": "string", "description": "Clear, self-contained description of what to investigate and what the report should contain." },
-                        "agentType": { "type": "string", "description": "Optional custom agent type name (loads .novacode/agents/<type>.md as the sub-agent role)." }
+                        "agentType": { "type": "string", "description": "Optional custom agent type name (loads .novacode/agents/<type>.md as the sub-agent role)." },
+                        "background": { "type": "boolean", "description": "Run asynchronously: return a taskId immediately instead of blocking. Poll with get_task_output, stop with kill_task. Default false." }
                     },
                     "required": ["description"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_task_output",
+                "description": "Poll a background sub-agent task (started by run_subtask background=true) for its accumulated report and status (running/done/killed/error). Set block=true to wait until it finishes or timeoutSecs elapses.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "taskId": { "type": "string", "description": "The taskId returned by run_subtask background=true." },
+                        "block": { "type": "boolean", "description": "Wait for completion (up to timeoutSecs) instead of returning immediately. Default false." },
+                        "timeoutSecs": { "type": "integer", "description": "Max seconds to wait when block=true. Default 30, max 120." }
+                    },
+                    "required": ["taskId"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "kill_task",
+                "description": "Stop a running background sub-agent task by taskId.",
+                "parameters": { "type": "object", "properties": { "taskId": { "type": "string" } }, "required": ["taskId"], "additionalProperties": false }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_tasks",
+                "description": "List all background sub-agent tasks with their id, description and status.",
+                "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_mcp_resources",
+                "description": "List resources exposed by connected MCP servers (resources/list). Optionally filter by server name. Returns each resource's uri, name and mimeType.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "server": { "type": "string", "description": "Optional MCP server name to filter by; omit to list across all connected servers." }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_mcp_resource",
+                "description": "Read a resource from a connected MCP server (resources/read), returning its text content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "server": { "type": "string", "description": "MCP server name that exposes the resource." },
+                        "uri": { "type": "string", "description": "The resource URI to read (from list_mcp_resources)." }
+                    },
+                    "required": ["server", "uri"],
                     "additionalProperties": false
                 }
             }
@@ -3553,6 +4081,12 @@ fn execute_builtin_tool_call(
             serde_json::to_value(search_text(workspace_path, request).map_err(|err| err.to_string())?)
                 .map_err(|err| err.to_string())
         }
+        "glob_files" => {
+            let request = serde_json::from_str::<GlobFilesRequest>(arguments)
+                .map_err(|err| format!("工具参数解析失败: {err}"))?;
+            serde_json::to_value(glob_files(workspace_path, request).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())
+        }
         "move_path" => {
             let request = serde_json::from_str::<MovePathRequest>(arguments)
                 .map_err(|err| format!("工具参数解析失败: {err}"))?;
@@ -3591,17 +4125,21 @@ fn tool_capability_for_name(tool_name: &str) -> Result<ToolCapability, String> {
         return Ok(ToolCapability::NetworkAccess);
     }
     match tool_name {
-        // todo_write/load_skill/run_subtask 只读或纯 UI；remember 仅追加项目记忆文件，低风险。
-        "list_dir" | "read_file" | "stat_path" | "search_text" | "todo_write"
-        | "run_subtask" | "load_skill" | "remember" | "list_shells" | "get_shell_output"
-        | "kill_shell" => Ok(ToolCapability::FileRead),
+        // 只读或纯 UI / 后台控制类工具：自动放行，不打断用户。remember 仅追加项目记忆文件，低风险。
+        "list_dir" | "read_file" | "stat_path" | "search_text" | "glob_files" | "todo_write"
+        | "ask_user" | "run_subtask" | "load_skill" | "remember" | "list_shells"
+        | "get_shell_output" | "kill_shell" | "get_task_output" | "kill_task" | "list_tasks" => {
+            Ok(ToolCapability::FileRead)
+        }
         "create_file" | "write_file" | "edit_file" | "make_dir" | "move_path" => {
             Ok(ToolCapability::FileWrite)
         }
         "delete_file" | "delete_dir" => Ok(ToolCapability::FileDelete),
         // 注册 MCP 会拉起外部进程/网络服务，按命令执行级别裁决（FullAccess 或审批）。
         "run_command" | "add_mcp_server" => Ok(ToolCapability::CommandRun),
-        "web_fetch" | "web_search" => Ok(ToolCapability::NetworkAccess),
+        "web_fetch" | "web_search" | "list_mcp_resources" | "read_mcp_resource" => {
+            Ok(ToolCapability::NetworkAccess)
+        }
         other => Err(format!("未知工具: {other}")),
     }
 }
@@ -3638,7 +4176,7 @@ mod tests {
 
         let injected = messages_with_workspace_context(
             messages,
-            Some("C:\\Users\\AIT\\Desktop\\NovaCode"),
+            Some("C:\\workspace\\demo"),
             Some("NovaCode"),
             None,
             None,
@@ -3650,7 +4188,7 @@ mod tests {
         assert!(injected[0].content.contains("NovaCode"));
         assert!(injected[0].content.contains(".novacode"));
         assert_eq!(injected[1].role, "system");
-        assert!(injected[1].content.contains("C:\\Users\\AIT\\Desktop\\NovaCode"));
+        assert!(injected[1].content.contains("C:\\workspace\\demo"));
         assert!(injected[1].content.contains("NovaCode"));
         assert!(injected[1].content.contains("除非用户明确授权越界"));
         assert!(injected[1].content.contains("必须分别调用"));
@@ -3763,7 +4301,7 @@ mod tests {
 
         let injected = messages_with_workspace_context(
             messages,
-            Some("C:\\Users\\AIT\\Desktop\\NovaCode"),
+            Some("C:\\workspace\\demo"),
             Some("NovaCode"),
             Some("src/\n  main.rs\nCargo.toml"),
             None,
@@ -3787,7 +4325,7 @@ mod tests {
 
         let injected = messages_with_workspace_context(
             messages,
-            Some("C:\\Users\\AIT\\Desktop\\NovaCode"),
+            Some("C:\\workspace\\demo"),
             Some("NovaCode"),
             None,
             Some("项目目标：做一个计算器。代码规范：KISS。"),
@@ -3975,10 +4513,12 @@ fn main() {
                 db: Mutex::new(db),
                 cancels: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
+                ask_questions: Mutex::new(HashMap::new()),
                 mcp: Mutex::new(HashMap::new()),
                 steering: Mutex::new(HashMap::new()),
                 repo_maps: Mutex::new(HashMap::new()),
                 bg_shells: Mutex::new(HashMap::new()),
+                bg_tasks: Mutex::new(HashMap::new()),
                 command_sandbox: AtomicBool::new(true),
                 task_token_budget: AtomicU64::new(0),
             });
@@ -4037,6 +4577,7 @@ fn main() {
             cancel_agent,
             queue_steering,
             respond_approval,
+            respond_ask_user,
             get_workspace,
             set_workspace_path,
             clear_workspace,
