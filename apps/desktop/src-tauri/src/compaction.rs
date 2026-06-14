@@ -113,6 +113,7 @@ fn render_wire_message_for_summary(message: &serde_json::Value) -> String {
 /// 「目标/已完成/关键决策/文件改动/下一步」备忘录，以 system 消息插回，保证任务方向不丢。
 /// 返回压缩后的消息序列与摘要调用消耗的 usage；历史太短时原样返回。
 pub(crate) async fn summarize_wire_history(
+    base_url: &str,
     api_key: &str,
     model: &str,
     wire_messages: Vec<serde_json::Value>,
@@ -138,6 +139,7 @@ pub(crate) async fn summarize_wire_history(
     );
 
     let result = chat_completion_with_retry(
+        base_url,
         api_key,
         vec![serde_json::json!({ "role": "user", "content": prompt })],
         model,

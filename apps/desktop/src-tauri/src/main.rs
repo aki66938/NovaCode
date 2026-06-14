@@ -31,6 +31,10 @@ use commands::{
     respond_ask_user, revert_to_checkpoint, set_command_sandbox, set_task_budget, set_workspace_path,
     toggle_mcp_server,
 };
+use commands::{
+    get_app_setting, get_model_provider_config, remove_model_provider, save_model_provider,
+    set_app_setting,
+};
 
 mod agent_loop;
 use agent_loop::send_message;
@@ -197,6 +201,11 @@ fn main() {
             clear_workspace,
             check_update,
             install_update,
+            get_model_provider_config,
+            save_model_provider,
+            remove_model_provider,
+            get_app_setting,
+            set_app_setting,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run NovaCode desktop app");

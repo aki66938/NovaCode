@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter};
 /// 可重试错误（网络收发失败、服务端错误、429）按 0.5s→1s→2s 退避重试，最多 4 次；
 /// 确定性错误（认证、余额、参数、上下文超限）立即返回不重试。重试时向前端推送提示。
 pub(crate) async fn chat_completion_with_retry(
+    base_url: &str,
     api_key: &str,
     messages: Vec<serde_json::Value>,
     model: &str,
@@ -25,7 +26,7 @@ pub(crate) async fn chat_completion_with_retry(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match chat_completion(api_key, messages.clone(), model, tools.clone()).await {
+        match chat_completion(base_url, api_key, messages.clone(), model, tools.clone()).await {
             Ok(result) => return Ok(result),
             Err(err) if err.is_retryable() && attempt < MAX_ATTEMPTS => {
                 let delay_ms = 500u64 * 2u64.pow(attempt - 1);
@@ -54,6 +55,7 @@ pub(crate) fn fallback_model_for(model: &str) -> Option<&'static str> {
 }
 
 pub(crate) async fn stream_round_with_retry(
+    base_url: &str,
     api_key: &str,
     messages: Vec<serde_json::Value>,
     model: &str,
@@ -70,6 +72,7 @@ pub(crate) async fn stream_round_with_retry(
         let emitted_cb = emitted.clone();
         let app_cb = app.clone();
         let result = chat_stream_with_tools(
+            base_url,
             api_key,
             messages.clone(),
             &model,

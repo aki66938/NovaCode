@@ -24,6 +24,41 @@ pub enum DeepSeekError {
     Http(#[from] reqwest::Error),
 }
 
+/// 内置预设供应商的官方 OpenAI 兼容端点（base_url，不含 /chat/completions 后缀）。
+///
+/// 输入预设标识（deepseek/zhipu/moonshot/qwen），输出官方 base_url；未知预设返回 None
+/// （custom 预设不在此表，必须由用户显式填 base_url）。清单可按需增补。
+pub fn preset_base_url(preset: &str) -> Option<&'static str> {
+    match preset {
+        "deepseek" => Some("https://api.deepseek.com"),
+        "zhipu" => Some("https://open.bigmodel.cn/api/paas/v4"),
+        "moonshot" => Some("https://api.moonshot.cn/v1"),
+        "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        _ => None,
+    }
+}
+
+/// 解析最终生效的 base_url：优先用显式 base_url（自定义覆盖），为空时回退到 preset 官方端点。
+///
+/// 输入可空的 base_url 与可空的 preset；任一可得即返回去掉尾部斜杠的串；都缺失返回 None
+/// （上层应据此报「未配置」错误）。
+pub fn resolve_base_url(base_url: Option<&str>, preset: Option<&str>) -> Option<String> {
+    let explicit = base_url.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(url) = explicit {
+        return Some(url.trim_end_matches('/').to_string());
+    }
+    preset
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(preset_base_url)
+        .map(|url| url.trim_end_matches('/').to_string())
+}
+
+/// 拼接 base_url 与 /chat/completions（base_url 已去尾斜杠）。
+fn chat_completions_url(base_url: &str) -> String {
+    format!("{}/chat/completions", base_url.trim_end_matches('/'))
+}
+
 impl DeepSeekError {
     /// 判断该错误是否为瞬时、可重试的错误。
     ///
@@ -65,12 +100,12 @@ pub struct ChatCompletionResult {
     pub usage: Option<RawUsage>,
 }
 
-/// 检测当前进程是否能读取 DeepSeek API Key。
+/// 根据「主 provider 是否已配置且 key 非空」给出 API Key 状态（Plan17 D3：不再读环境变量）。
 ///
-/// 输入环境变量读取闭包，输出脱敏后的 API Key 状态；
+/// 输入主 provider 的 api_key（None 表示未配置任何主 provider），输出脱敏状态；
 /// 本方法不返回、不记录、不持久化 Key 明文。
-pub fn detect_api_key_status(read_env: impl FnOnce(&str) -> Option<String>) -> ApiKeyStatus {
-    match read_env("DEEPSEEK_API_KEY") {
+pub fn detect_api_key_status(api_key: Option<&str>) -> ApiKeyStatus {
+    match api_key {
         Some(v) if !v.trim().is_empty() => ApiKeyStatus::Configured,
         _ => ApiKeyStatus::Missing,
     }
@@ -98,12 +133,13 @@ fn classify_api_error(status: u16, body: &str) -> DeepSeekError {
     }
 }
 
-/// 向 DeepSeek API 发起流式聊天请求，通过回调逐块推送内容，完成后返回原始 usage。
+/// 向 OpenAI 兼容端点发起流式聊天请求，通过回调逐块推送内容，完成后返回原始 usage。
 ///
-/// 输入 API Key、消息列表和模型名；每收到内容 chunk 调用一次 on_chunk；
-/// 流结束后返回服务端原始 usage（若缺失则返回 None）；
+/// 输入 base_url（已解析的官方/自定义端点）、API Key、消息列表和模型名；每收到内容 chunk
+/// 调用一次 on_chunk；流结束后返回服务端原始 usage（若缺失则返回 None）；
 /// 错误时流中断，on_chunk 不再被调用。
 pub async fn chat_stream<F>(
+    base_url: &str,
     api_key: &str,
     messages: Vec<ChatMessage>,
     model: &str,
@@ -126,7 +162,7 @@ where
     });
 
     let response = client
-        .post("https://api.deepseek.com/chat/completions")
+        .post(chat_completions_url(base_url))
         .bearer_auth(api_key)
         .json(&body)
         .send()
@@ -214,6 +250,7 @@ fn tool_markup_index(content: &str) -> Option<usize> {
 /// 内置防泄漏守卫：一旦检测到正文出现工具调用标记（DSML / `<ToolCall>`），停止外显后续内容，
 /// 把整段标记留给上层 DSML 兜底解析，避免标记 token 流到界面。完整 content 仍在返回值里供解析。
 pub async fn chat_stream_with_tools<F>(
+    base_url: &str,
     api_key: &str,
     messages: Vec<serde_json::Value>,
     model: &str,
@@ -240,7 +277,7 @@ where
     }
 
     let response = client
-        .post("https://api.deepseek.com/chat/completions")
+        .post(chat_completions_url(base_url))
         .bearer_auth(api_key)
         .json(&body)
         .send()
@@ -365,6 +402,7 @@ where
 /// 输入 API Key、消息 JSON、模型名和可选工具列表；输出 assistant 内容、tool calls 和 usage。
 /// 本方法不执行工具，只负责解析模型意图。
 pub async fn chat_completion(
+    base_url: &str,
     api_key: &str,
     messages: Vec<serde_json::Value>,
     model: &str,
@@ -389,7 +427,7 @@ pub async fn chat_completion(
     }
 
     let response = client
-        .post("https://api.deepseek.com/chat/completions")
+        .post(chat_completions_url(base_url))
         .bearer_auth(api_key)
         .json(&body)
         .send()

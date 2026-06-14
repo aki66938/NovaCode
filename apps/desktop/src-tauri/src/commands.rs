@@ -8,16 +8,20 @@ use crate::chat::chat_completion_with_retry;
 use crate::checkpoint::apply_checkpoint_revert;
 use crate::mcp::spawn_mcp_connect;
 use crate::state::AppState;
-use novacode_deepseek_client::{detect_api_key_status, get_user_balance, UserBalance};
+use novacode_deepseek_client::{detect_api_key_status, get_user_balance, resolve_base_url, UserBalance};
 use novacode_shared::{ApiKeyStatus, PermissionMode};
 use novacode_storage::{
     add_mcp_server, add_permission_rule, clear_active_workspace, create_conversation,
     create_conversation_with_workspace, delete_conversation, delete_messages, get_active_workspace,
-    get_activity_events, get_conversation, get_messages, list_conversations, list_file_checkpoints,
+    get_activity_events, get_conversation, get_messages, get_model_provider, list_conversations,
+    list_file_checkpoints,
     list_mcp_servers, list_permission_rules, mark_checkpoint_reverted, remove_mcp_server,
     remove_permission_rule, save_active_workspace, save_message, set_conversation_archived,
     set_conversation_pinned, set_mcp_server_enabled, update_title, ActivityEventRecord,
     Conversation, FileCheckpoint, StoredMessage, Workspace,
+};
+use novacode_storage::{
+    delete_model_provider, get_setting, set_setting, upsert_model_provider, ModelProvider,
 };
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -26,8 +30,84 @@ use tauri_plugin_updater::UpdaterExt;
 // ── DeepSeek ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub(crate) fn get_deepseek_api_key_status() -> ApiKeyStatus {
-    detect_api_key_status(|name| std::env::var(name).ok())
+pub(crate) fn get_deepseek_api_key_status(state: State<AppState>) -> ApiKeyStatus {
+    // Plan17 D3：纯以 DB 主 provider 是否已配置为准，不再读环境变量。
+    let key = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| get_model_provider(&db, "main").ok().flatten().map(|p| p.api_key));
+    detect_api_key_status(key.as_deref())
+}
+
+// ── 模型供应商（Plan17）─────────────────────────────────────────────────────
+
+/// 按角色读取 provider（main / vision）。api_key 脱敏为空：仅表明已配置 + 回传非密字段。
+#[tauri::command]
+pub(crate) fn get_model_provider_config(
+    state: State<AppState>,
+    role: String,
+) -> Result<Option<ModelProvider>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let mut provider = get_model_provider(&db, &role).map_err(|e| e.to_string())?;
+    if let Some(p) = provider.as_mut() {
+        p.api_key = String::new(); // 不回显明文 key（Plan17 §6.2）
+    }
+    Ok(provider)
+}
+
+/// 保存（upsert）某角色的 provider。base_url 留空＝用 preset 官方端点。
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub(crate) fn save_model_provider(
+    state: State<AppState>,
+    role: String,
+    preset: Option<String>,
+    label: Option<String>,
+    base_url: Option<String>,
+    api_key: String,
+    model_id: String,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    upsert_model_provider(
+        &db,
+        &role,
+        preset.as_deref(),
+        label.as_deref(),
+        base_url.as_deref().filter(|s| !s.trim().is_empty()),
+        api_key.trim(),
+        model_id.trim(),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 删除某角色的 provider（如关闭模态扩展时移除视觉 provider）。
+#[tauri::command]
+pub(crate) fn remove_model_provider(state: State<AppState>, role: String) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    delete_model_provider(&db, &role).map_err(|e| e.to_string())
+}
+
+/// 读取一个应用设置（如 modality_extended 开关）。
+#[tauri::command]
+pub(crate) fn get_app_setting(
+    state: State<AppState>,
+    key: String,
+) -> Result<Option<String>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    get_setting(&db, &key).map_err(|e| e.to_string())
+}
+
+/// 写入一个应用设置。
+#[tauri::command]
+pub(crate) fn set_app_setting(
+    state: State<AppState>,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    set_setting(&db, &key, &value).map_err(|e| e.to_string())
 }
 
 // ── 会话管理 ──────────────────────────────────────────────────────────────
@@ -144,11 +224,17 @@ pub(crate) fn pin_conversation(
     set_conversation_pinned(&db, &conversation_id, pinned).map_err(|e| e.to_string())
 }
 
-/// 查询 DeepSeek 账户余额，供设置页展示。从环境变量读取 API Key，不缓存、不持久化。
+/// 查询 DeepSeek 账户余额，供设置页展示。Plan17 D3：从 DB 主 provider 取 Key（仅 deepseek 预设有意义），不再读环境变量。
 #[tauri::command]
-pub(crate) async fn get_account_balance() -> Result<UserBalance, String> {
-    let api_key = std::env::var("DEEPSEEK_API_KEY")
-        .map_err(|_| "DEEPSEEK_API_KEY 未配置".to_string())?;
+pub(crate) async fn get_account_balance(state: State<'_, AppState>) -> Result<UserBalance, String> {
+    let api_key = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        get_model_provider(&db, "main")
+            .map_err(|e| e.to_string())?
+            .map(|p| p.api_key)
+            .filter(|k| !k.trim().is_empty())
+            .ok_or_else(|| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?
+    };
     get_user_balance(&api_key).await.map_err(|e| e.to_string())
 }
 
@@ -235,11 +321,19 @@ pub(crate) async fn compact_history(
     conversation_id: String,
     model: String,
 ) -> Result<(), String> {
-    let api_key = std::env::var("DEEPSEEK_API_KEY")
-        .map_err(|_| "DEEPSEEK_API_KEY 未配置".to_string())?;
-    let messages = {
+    let (base_url, api_key, messages) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        get_messages(&db, &conversation_id).map_err(|e| e.to_string())?
+        // 主模型 provider（Plan17 D3）：一律从 DB 取，无主 provider 即报错引导去设置页。
+        let (base_url, api_key) = match get_model_provider(&db, "main") {
+            Ok(Some(p)) => {
+                let bu = resolve_base_url(p.base_url.as_deref(), p.preset.as_deref())
+                    .ok_or_else(|| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?;
+                (bu, p.api_key)
+            }
+            _ => return Err("未配置主模型：请在 设置 → 模型供应商 配置".to_string()),
+        };
+        let messages = get_messages(&db, &conversation_id).map_err(|e| e.to_string())?;
+        (base_url, api_key, messages)
     };
     if messages.len() < 4 {
         return Err("当前会话消息较少，无需压缩".to_string());
@@ -259,6 +353,7 @@ pub(crate) async fn compact_history(
 4）涉及的文件清单；5）当前进度与待办。只输出备忘录本身。\n\n{transcript}"
     );
     let result = chat_completion_with_retry(
+        &base_url,
         &api_key,
         vec![serde_json::json!({ "role": "user", "content": prompt })],
         &model,

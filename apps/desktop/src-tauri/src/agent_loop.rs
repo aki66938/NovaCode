@@ -30,10 +30,10 @@ use crate::tools::{
 };
 use crate::web::{execute_web_fetch, execute_web_search};
 use crate::{commands::permission_mode_from_str, merge_usage, record_tool_event};
-use novacode_deepseek_client::{chat_stream, ChatMessage};
+use novacode_deepseek_client::{chat_stream, resolve_base_url, ChatMessage};
 use novacode_sandbox_runtime::{session_security_context, NetworkMode};
 use novacode_shared::PermissionMode;
-use novacode_storage::{get_conversation, list_permission_rules};
+use novacode_storage::{get_conversation, get_model_provider, list_permission_rules};
 use novacode_token_accounting::{compute_cost_summary, deepseek_pricing_for_model};
 use novacode_tool_runtime::RunCommandRequest;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,16 +61,24 @@ pub(crate) async fn send_message(
     permission_mode: String,
     plan_mode: Option<bool>,
 ) -> Result<(), String> {
-    let api_key = std::env::var("DEEPSEEK_API_KEY")
-        .map_err(|_| "DEEPSEEK_API_KEY 未配置".to_string())?;
     let plan_mode = plan_mode.unwrap_or(false);
-    let (conversation, permission_rules) = {
+    let (conversation, permission_rules, base_url, api_key) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let conversation = get_conversation(&db, &conversation_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "会话不存在".to_string())?;
         let rules = list_permission_rules(&db).unwrap_or_default();
-        (conversation, rules)
+        // 主模型 provider（Plan17 D3）：base_url/api_key 一律从 DB 取；base_url 为空时解析 preset 官方端点。
+        // DB 无主 provider 即报错引导去设置页，不再回退环境变量。
+        let (base_url, api_key) = match get_model_provider(&db, "main") {
+            Ok(Some(p)) => {
+                let bu = resolve_base_url(p.base_url.as_deref(), p.preset.as_deref())
+                    .ok_or_else(|| "未配置主模型：请在 设置 → 模型供应商 配置".to_string())?;
+                (bu, p.api_key)
+            }
+            _ => return Err("未配置主模型：请在 设置 → 模型供应商 配置".to_string()),
+        };
+        (conversation, rules, base_url, api_key)
     };
     // 工作区已绑定时生成 repo map 与长期记忆，注入项目结构摘要和持久约定供模型开局认知。
     // repo map 按会话缓存：首轮生成后复用，保持 system 前缀字节稳定以提升 prompt 缓存命中。
@@ -119,7 +127,7 @@ pub(crate) async fn send_message(
 
     let result = if plan_mode {
         // 计划模式走纯流式（无工具），让模型把计划直接流给用户审阅。
-        chat_stream(&api_key, messages, &model, |chunk| {
+        chat_stream(&base_url, &api_key, messages, &model, |chunk| {
             let _ = app.emit("chat-chunk", chunk);
         })
         .await
@@ -127,6 +135,7 @@ pub(crate) async fn send_message(
     } else if let Some(workspace_path) = conversation.workspace_path.as_deref() {
         let mcp_bindings = collect_mcp_bindings(&app);
         chat_with_builtin_tools(
+            &base_url,
             &api_key,
             messages,
             &model,
@@ -140,7 +149,7 @@ pub(crate) async fn send_message(
         )
         .await
     } else {
-        chat_stream(&api_key, messages, &model, |chunk| {
+        chat_stream(&base_url, &api_key, messages, &model, |chunk| {
             let _ = app.emit("chat-chunk", chunk);
         })
         .await
@@ -273,6 +282,7 @@ fn read_workspace_memory(workspace_root: &str) -> Option<String> {
 /// 所有工具执行前都经 SessionSecurityContext 裁决。
 #[allow(clippy::too_many_arguments)]
 async fn chat_with_builtin_tools(
+    base_url: &str,
     api_key: &str,
     messages: Vec<ChatMessage>,
     model: &str,
@@ -344,7 +354,7 @@ async fn chat_with_builtin_tools(
             } else {
                 let _ = app.emit("agent-status", serde_json::json!({ "state": "compacting" }));
                 let (new_wire, summary_usage) =
-                    summarize_wire_history(api_key, model, std::mem::take(&mut wire_messages), app)
+                    summarize_wire_history(base_url, api_key, model, std::mem::take(&mut wire_messages), app)
                         .await?;
                 wire_messages = new_wire;
                 usage = merge_usage(usage, summary_usage);
@@ -366,7 +376,7 @@ async fn chat_with_builtin_tools(
 
         // 流式获取本轮结果：叙述 token 边流边显（内置标记防泄漏守卫），同时累积 tool_calls。
         let completion =
-            stream_round_with_retry(api_key, wire_messages.clone(), model, tool_schemas.clone(), app)
+            stream_round_with_retry(base_url, api_key, wire_messages.clone(), model, tool_schemas.clone(), app)
                 .await?;
         usage = merge_usage(usage, completion.usage.clone());
         // 成本预算：累计 total_tokens 超过预算则暂停（防失控烧 token）。
@@ -593,6 +603,7 @@ async fn chat_with_builtin_tools(
                         serde_json::json!({ "state": "thinking", "round": round }),
                     );
                     let (sub_result, sub_usage) = execute_run_subtask(
+                        base_url,
                         api_key,
                         model,
                         workspace_path,

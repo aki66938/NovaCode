@@ -10,7 +10,7 @@ import {
   SquarePen, Search, Pin, Archive, ArchiveRestore, Trash2, Settings2,
   Paperclip, ListChecks, Square, ArrowUp, GitCompare, Plug, Sun, Moon,
   Check, X, Ban, Info, CircleDot, CheckSquare, ChevronRight,
-  ChevronDown, FolderOpen, Gauge, AtSign, CornerDownRight,
+  ChevronDown, FolderOpen, Gauge, AtSign, CornerDownRight, Eye, EyeOff, Lock,
 } from "lucide-react";
 
 /** NovaCode 品牌标识：深海声纳波纹（致敬 DeepSeek 的「deep」，非官方鲸鱼 logo） */
@@ -188,6 +188,49 @@ const PERMISSION_MODES: PermissionMode[] = [
   "workspace_auto",
   "full_access",
 ];
+
+// ── 模型供应商预设（Plan17 §6.2）─────────────────────────────────────────────
+// preset 携带官方 base_url（与后端 preset_base_url 表保持一致）；custom 必须用户填 base_url。
+type ProviderPreset = {
+  id: string;
+  label: string;
+  /** 官方端点；作为高级行 Base URL 输入框的 placeholder（留空＝用它）。custom 无官方端点。 */
+  baseUrl: string | null;
+  /** 切换到该预设时给出的合理默认 modelId 占位。 */
+  defaultModelId: string;
+};
+
+const PROVIDER_PRESETS: ProviderPreset[] = [
+  { id: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com", defaultModelId: "deepseek-v4-pro" },
+  { id: "zhipu", label: "智谱 GLM", baseUrl: "https://open.bigmodel.cn/api/paas/v4", defaultModelId: "glm-4" },
+  { id: "moonshot", label: "月之暗面 Kimi", baseUrl: "https://api.moonshot.cn/v1", defaultModelId: "moonshot-v1-8k" },
+  { id: "qwen", label: "通义", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", defaultModelId: "qwen-plus" },
+  { id: "custom", label: "自定义", baseUrl: null, defaultModelId: "" },
+];
+
+/** 视觉块预设默认 modelId 占位（识图模型）。 */
+const VISION_PRESET_MODEL: Record<string, string> = {
+  deepseek: "deepseek-vl",
+  zhipu: "glm-4v",
+  moonshot: "moonshot-v1-8k-vision-preview",
+  qwen: "qwen-vl-plus",
+  custom: "",
+};
+
+/** 主 provider 配置回填形状（get_model_provider_config 返回，apiKey 已脱敏为空）。 */
+type ProviderConfig = {
+  id: string;
+  role: string;
+  preset?: string | null;
+  label?: string | null;
+  baseUrl?: string | null;
+  apiKey: string;
+  modelId: string;
+  enabled: boolean;
+  updatedAt?: number | null;
+};
+
+const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp"];
 
 /** 斜杠命令清单：输入框以 / 开头时弹出 */
 const SLASH_COMMANDS: Array<{ cmd: string; desc: string }> = [
@@ -1033,11 +1076,27 @@ export function App() {
   async function handleImportFile() {
     if (sending) return;
     try {
-      const selected = await open({
-        multiple: false,
-        filters: [{ name: "文档", extensions: ["txt", "md", "csv", "json", "log", "pdf", "docx", "xml", "html", "toml", "yaml", "yml"] }],
-      });
+      // 模态门禁（Plan17 §7）：有 vision provider 才放开图像入口（本阶段仅放开选择，不做识图推理）。
+      const visionCfg = await invoke<ProviderConfig | null>("get_model_provider_config", { role: "vision" }).catch(() => null);
+      const hasVision = !!visionCfg;
+      const textExtensions = ["txt", "md", "csv", "json", "log", "pdf", "docx", "xml", "html", "toml", "yaml", "yml"];
+      const filters = hasVision
+        ? [{ name: "文档与图像", extensions: [...textExtensions, ...IMAGE_EXTENSIONS] }]
+        : [{ name: "文档", extensions: textExtensions }];
+      const selected = await open({ multiple: false, filters });
       if (!selected || Array.isArray(selected)) return;
+      // 即使对话框可能放过（部分平台 filter 不强制），再按扩展名兜底门禁：无 vision 拒绝图像。
+      const ext = selected.split(".").pop()?.toLowerCase() ?? "";
+      if (IMAGE_EXTENSIONS.includes(ext)) {
+        if (!hasVision) {
+          appendNoticeToLastMessage("当前未配置视觉模型，无法导入图片。需在 设置 → 模型供应商 → 扩展 agent 的模态 里配置视觉模型。");
+          return;
+        }
+        // 有 vision provider：本阶段仅放开图像选择入口，识图推理留待后续 Plan。
+        const fileName = selected.split(/[\\/]/).pop() ?? selected;
+        appendNoticeToLastMessage(`已选择图片《${fileName}》。视觉识图能力即将上线，本版本暂只放开图像入口，尚未进行识图推理。`);
+        return;
+      }
       const result = await invoke<{ name: string; text: string; truncated: boolean }>(
         "import_file_text",
         { path: selected }
@@ -1530,7 +1589,6 @@ export function App() {
           apiKeyLabel={getApiKeyStatusLabel(apiKeyStatus)}
           balance={balance}
           onRefreshBalance={refreshBalance}
-          model={model}
           permissionMode={permissionMode}
           mcpServers={mcpServers}
           permRules={permRules}
@@ -1542,7 +1600,6 @@ export function App() {
           onExportConversation={handleExportConversation}
           onExportLedger={handleExportLedger}
           onClearData={handleClearData}
-          onModelChange={handleModelChange}
           onPermissionModeChange={handlePermissionModeChange}
           onAddMcpServer={handleAddMcpServer}
           onToggleMcpServer={handleToggleMcpServer}
@@ -1628,6 +1685,211 @@ function ChangesModal({
   );
 }
 
+// ── ProviderCard（Plan17 §6.2）───────────────────────────────────────────────
+
+/**
+ * 可复用的模型供应商卡片：主模型 role="main"、视觉 role="vision" 各用一次。
+ * 两栏网格表单（供应商|模型 一行，API Key 整行，高级折叠行整行），右上角状态徽标，底部保存按钮右对齐。
+ * 挂载时回填 get_model_provider_config；保存调 save_model_provider；不回显明文 key。
+ */
+function ProviderCard({
+  role,
+  title,
+  onSaved,
+}: {
+  role: "main" | "vision";
+  title: string;
+  onSaved?: () => void;
+}) {
+  const presetModel = role === "vision" ? VISION_PRESET_MODEL : null;
+  const [preset, setPreset] = useState<string>("deepseek");
+  const [apiKey, setApiKey] = useState("");
+  const [modelId, setModelId] = useState(
+    role === "vision" ? VISION_PRESET_MODEL.deepseek : "deepseek-v4-pro",
+  );
+  const [baseUrl, setBaseUrl] = useState("");
+  const [showKey, setShowKey] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  // 已配置：挂载回填到 true，或保存成功后置 true。controls 状态徽标 + key 占位文案。
+  const [configured, setConfigured] = useState(false);
+  // 已配置但用户尚未在本次会话改动 key 时，占位显示「已配置 ••••」而非空密码框。
+  const [keyTouched, setKeyTouched] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const presetMeta = PROVIDER_PRESETS.find((p) => p.id === preset) ?? PROVIDER_PRESETS[0];
+  const isCustom = preset === "custom";
+
+  // 挂载时回填已存配置（apiKey 脱敏为空：configured=true 但不回显明文）。
+  useEffect(() => {
+    let alive = true;
+    invoke<ProviderConfig | null>("get_model_provider_config", { role })
+      .then((cfg) => {
+        if (!alive || !cfg) return;
+        const p = cfg.preset ?? "deepseek";
+        setPreset(p);
+        setModelId(cfg.modelId || (presetModel ? presetModel[p] ?? "" : PROVIDER_PRESETS.find((x) => x.id === p)?.defaultModelId ?? ""));
+        setBaseUrl(cfg.baseUrl ?? "");
+        setConfigured(true);
+        if (cfg.baseUrl || p === "custom") setAdvancedOpen(true);
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [role]);
+
+  function handlePresetChange(next: string) {
+    setPreset(next);
+    const meta = PROVIDER_PRESETS.find((p) => p.id === next);
+    // 切换预设给出合理默认 modelId 占位（视觉块用识图模型表）。
+    setModelId(presetModel ? presetModel[next] ?? "" : meta?.defaultModelId ?? "");
+    // custom 自动展开高级行（base_url 必填）；非 custom 收起并清空自定义端点回到官方。
+    if (next === "custom") {
+      setAdvancedOpen(true);
+    } else {
+      setAdvancedOpen(false);
+      setBaseUrl("");
+    }
+  }
+
+  async function handleSave() {
+    setError(null);
+    if (isCustom && !baseUrl.trim()) {
+      setError("自定义供应商必须填写 Base URL");
+      setAdvancedOpen(true);
+      return;
+    }
+    if (!modelId.trim()) {
+      setError("请填写模型 ID");
+      return;
+    }
+    // 已配置且用户未改动 key 时不允许提交空 key（避免清掉已存 key）。首次配置必须填 key。
+    if (!keyTouched && !configured && !apiKey.trim()) {
+      setError("请填写 API Key");
+      return;
+    }
+    if (keyTouched && !apiKey.trim()) {
+      setError("请填写 API Key");
+      return;
+    }
+    if (!configured && !apiKey.trim()) {
+      setError("请填写 API Key");
+      return;
+    }
+    setSaving(true);
+    try {
+      await invoke("save_model_provider", {
+        role,
+        preset,
+        label: presetMeta.label,
+        baseUrl: baseUrl.trim() || null,
+        apiKey: apiKey.trim(),
+        modelId: modelId.trim(),
+      });
+      setConfigured(true);
+      setKeyTouched(false);
+      setApiKey("");
+      onSaved?.();
+    } catch (err) {
+      setError(humanizeError(String(err)));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // 密码框：已配置且本次未改动 → 占位「已配置 ••••」（只读感）；用户聚焦输入即视为改动。
+  const keyPlaceholder = configured && !keyTouched ? "已配置 ••••（如需更换请重新输入）" : "sk-...";
+
+  return (
+    <div className="provider-card">
+      <div className="provider-card__head">
+        <span className="provider-card__title">{title}</span>
+        <span className={`provider-badge${configured ? " provider-badge--on" : ""}`}>
+          {configured ? "● 已配置" : "○ 未配置"}
+        </span>
+      </div>
+
+      <div className="provider-grid">
+        <label className="provider-field">
+          <span className="provider-field__label">供应商</span>
+          <select className="model-select" value={preset} onChange={(e) => handlePresetChange(e.target.value)}>
+            {PROVIDER_PRESETS.map((p) => (
+              <option key={p.id} value={p.id}>{p.label}</option>
+            ))}
+          </select>
+        </label>
+        <label className="provider-field">
+          <span className="provider-field__label">模型</span>
+          <input
+            className="conv-search provider-input"
+            type="text"
+            value={modelId}
+            placeholder={presetMeta.defaultModelId || "model-id"}
+            onChange={(e) => setModelId(e.target.value)}
+          />
+        </label>
+
+        <label className="provider-field provider-field--full">
+          <span className="provider-field__label">API Key</span>
+          <span className="provider-key">
+            <input
+              className="conv-search provider-input"
+              type={showKey ? "text" : "password"}
+              value={apiKey}
+              placeholder={keyPlaceholder}
+              onChange={(e) => { setApiKey(e.target.value); setKeyTouched(true); }}
+            />
+            <button
+              type="button"
+              className="provider-key__eye"
+              title={showKey ? "隐藏" : "显示"}
+              onClick={() => setShowKey((v) => !v)}
+            >
+              {showKey ? <EyeOff size={15} /> : <Eye size={15} />}
+            </button>
+          </span>
+        </label>
+
+        <div className="provider-field--full">
+          <button
+            type="button"
+            className="provider-advanced-toggle"
+            onClick={() => !isCustom && setAdvancedOpen((v) => !v)}
+            disabled={isCustom}
+            title={isCustom ? "自定义供应商必须填写 Base URL" : undefined}
+          >
+            {advancedOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+            高级设置（自定义 Base URL）
+          </button>
+          <div className={`provider-advanced${advancedOpen ? " provider-advanced--open" : ""}`}>
+            <div className="provider-advanced__inner">
+              <input
+                className="conv-search provider-input"
+                type="text"
+                value={baseUrl}
+                placeholder={presetMeta.baseUrl ?? "https://your-endpoint/v1"}
+                onChange={(e) => setBaseUrl(e.target.value)}
+              />
+              <p className="settings-desc" style={{ marginTop: 4 }}>
+                {isCustom
+                  ? "自定义供应商必须填写 Base URL（自托管/代理）。"
+                  : `留空即使用 ${presetMeta.label} 官方端点；自托管/代理可填。`}
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {error && <p className="settings-row__value" style={{ color: "var(--danger)" }}>{error}</p>}
+
+      <div className="provider-card__actions">
+        <button type="button" className="approval-card__btn approval-card__btn--allow" onClick={handleSave} disabled={saving}>
+          {saving ? "保存中…" : "保存"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── SettingsModal ───────────────────────────────────────────────────────────
 
 function SettingsModal({
@@ -1635,7 +1897,6 @@ function SettingsModal({
   apiKeyLabel,
   balance,
   onRefreshBalance,
-  model,
   permissionMode,
   mcpServers,
   permRules,
@@ -1647,7 +1908,6 @@ function SettingsModal({
   onExportConversation,
   onExportLedger,
   onClearData,
-  onModelChange,
   onPermissionModeChange,
   onAddMcpServer,
   onToggleMcpServer,
@@ -1662,7 +1922,6 @@ function SettingsModal({
   apiKeyLabel: string;
   balance: BalanceState;
   onRefreshBalance: () => void;
-  model: DeepSeekModelId;
   permissionMode: PermissionMode;
   mcpServers: McpServer[];
   permRules: string[];
@@ -1674,7 +1933,6 @@ function SettingsModal({
   onExportConversation: () => void;
   onExportLedger: () => void;
   onClearData: () => void;
-  onModelChange: (m: DeepSeekModelId) => void;
   onPermissionModeChange: (m: PermissionMode) => void;
   onAddMcpServer: (name: string, command: string, authToken?: string) => void;
   onToggleMcpServer: (id: string, enabled: boolean) => void;
@@ -1715,12 +1973,35 @@ function SettingsModal({
       setCheckBusy(false);
     }, 10000);
   }
-  const [section, setSection] = useState<"account" | "model" | "rules" | "mcp" | "data" | "about">("account");
+  const [section, setSection] = useState<"account" | "provider" | "permission" | "rules" | "mcp" | "data" | "about">("account");
   const [budgetInput, setBudgetInput] = useState(String(taskBudget));
+  // 「扩展 agent 的模态」开关：持久化于 settings(modality_extended)；开 → 露出视觉/音频块。
+  const [modalityExtended, setModalityExtended] = useState(false);
+  // 主 provider 是否 deepseek 预设：决定账户区 DeepSeek 余额卡片是否显示。
+  const [mainIsDeepseek, setMainIsDeepseek] = useState(false);
+
+  useEffect(() => {
+    invoke<string | null>("get_app_setting", { key: "modality_extended" })
+      .then((v) => setModalityExtended(v === "1"))
+      .catch(() => {});
+    invoke<ProviderConfig | null>("get_model_provider_config", { role: "main" })
+      .then((cfg) => setMainIsDeepseek((cfg?.preset ?? "deepseek") === "deepseek" && !!cfg))
+      .catch(() => {});
+  }, []);
+
+  async function handleToggleModality(next: boolean) {
+    setModalityExtended(next);
+    await invoke("set_app_setting", { key: "modality_extended", value: next ? "1" : "" }).catch(() => {});
+    // 关闭模态：移除视觉 provider，使图像门禁回到「无视觉」态。
+    if (!next) {
+      await invoke("remove_model_provider", { role: "vision" }).catch(() => {});
+    }
+  }
 
   const NAV: Array<{ id: typeof section; label: string }> = [
     { id: "account", label: "账户" },
-    { id: "model", label: "模型与权限" },
+    { id: "provider", label: "模型供应商" },
+    { id: "permission", label: "权限" },
     { id: "rules", label: "权限规则" },
     { id: "mcp", label: "MCP 服务器" },
     { id: "data", label: "数据" },
@@ -1755,62 +2036,102 @@ function SettingsModal({
                 <span className="settings-row__label">DeepSeek API Key</span>
                 <span className="settings-row__value">{apiKeyLabel}</span>
               </div>
-              <p className="settings-desc">API Key 仅从系统环境变量 <code>DEEPSEEK_API_KEY</code> 读取，不在应用内保存。</p>
+              <p className="settings-desc">API Key 在「<b>模型供应商</b>」选项卡中配置，存于本地，不上传云端。</p>
 
-              <div className="settings-section__head" style={{ marginTop: 16 }}>
-                <span>账户余额</span>
-                <button
-                  className="changes-row__revert"
-                  type="button"
-                  onClick={onRefreshBalance}
-                  disabled={balance.status === "loading"}
-                >
-                  {balance.status === "loading" ? "查询中…" : "刷新"}
-                </button>
-              </div>
-              {balance.status === "error" && (
-                <p className="settings-row__value" style={{ color: "var(--danger)" }}>{balance.message}</p>
-              )}
-              {balance.status === "ok" && (
+              {mainIsDeepseek && (
                 <>
-                  <div className="settings-row">
-                    <span className="settings-row__label">状态</span>
-                    <span className="settings-row__value" style={{ color: balance.data.isAvailable ? "var(--success)" : "var(--danger)" }}>
-                      {balance.data.isAvailable ? "余额充足，可正常调用" : "余额不足"}
-                    </span>
+                  <div className="settings-section__head" style={{ marginTop: 16 }}>
+                    <span>账户余额</span>
+                    <button
+                      className="changes-row__revert"
+                      type="button"
+                      onClick={onRefreshBalance}
+                      disabled={balance.status === "loading"}
+                    >
+                      {balance.status === "loading" ? "查询中…" : "刷新"}
+                    </button>
                   </div>
-                  {balance.data.balanceInfos.length === 0 && <p className="settings-row__value">未返回余额明细</p>}
-                  {balance.data.balanceInfos.map((b) => (
-                    <div key={b.currency} className="balance-card">
-                      <div className="balance-card__total">
-                        <span className="balance-card__amount">{b.totalBalance}</span>
-                        <span className="balance-card__currency">{b.currency}</span>
+                  {balance.status === "error" && (
+                    <p className="settings-row__value" style={{ color: "var(--danger)" }}>{balance.message}</p>
+                  )}
+                  {balance.status === "ok" && (
+                    <>
+                      <div className="settings-row">
+                        <span className="settings-row__label">状态</span>
+                        <span className="settings-row__value" style={{ color: balance.data.isAvailable ? "var(--success)" : "var(--danger)" }}>
+                          {balance.data.isAvailable ? "余额充足，可正常调用" : "余额不足"}
+                        </span>
                       </div>
-                      <div className="balance-card__detail">
-                        <span>充值 {b.toppedUpBalance}</span>
-                        <span>赠送 {b.grantedBalance}</span>
-                      </div>
-                    </div>
-                  ))}
+                      {balance.data.balanceInfos.length === 0 && <p className="settings-row__value">未返回余额明细</p>}
+                      {balance.data.balanceInfos.map((b) => (
+                        <div key={b.currency} className="balance-card">
+                          <div className="balance-card__total">
+                            <span className="balance-card__amount">{b.totalBalance}</span>
+                            <span className="balance-card__currency">{b.currency}</span>
+                          </div>
+                          <div className="balance-card__detail">
+                            <span>充值 {b.toppedUpBalance}</span>
+                            <span>赠送 {b.grantedBalance}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </>
+                  )}
                 </>
               )}
             </>
           )}
 
-          {section === "model" && (
+          {section === "provider" && (
             <>
-              <h3 className="settings-content__h">模型与权限</h3>
-              <div className="settings-row">
-                <span className="settings-row__label">默认模型</span>
-                <select className="model-select" value={model} onChange={(e) => onModelChange(e.target.value as DeepSeekModelId)}>
-                  {DEEPSEEK_MODELS.map((item) => (
-                    <option key={item.id} value={item.id}>{item.label}</option>
-                  ))}
-                </select>
-              </div>
-              <p className="settings-desc">新会话的默认模型。会话中也可在输入框上方临时切换，改动在下一轮生效。</p>
+              <h3 className="settings-content__h">模型供应商</h3>
+              <p className="settings-desc" style={{ marginTop: 0, marginBottom: 8 }}>
+                配置主模型供应商（OpenAI 兼容）：选预设、填 API Key 与模型 ID 即可。Base URL 留空走预设官方端点，自托管/代理可在高级设置里覆盖。
+              </p>
+              <ProviderCard
+                role="main"
+                title="主模型"
+                onSaved={() => {
+                  // 保存后刷新「DeepSeek 余额卡片是否显示」与顶栏 key 状态。
+                  invoke<ProviderConfig | null>("get_model_provider_config", { role: "main" })
+                    .then((cfg) => setMainIsDeepseek((cfg?.preset ?? "deepseek") === "deepseek" && !!cfg))
+                    .catch(() => {});
+                }}
+              />
 
-              <div className="settings-row" style={{ marginTop: 12 }}>
+              <label className="toggle provider-modality-toggle">
+                <input
+                  type="checkbox"
+                  checked={modalityExtended}
+                  onChange={(e) => handleToggleModality(e.target.checked)}
+                />
+                <span><b>扩展 agent 的模态</b>　开启后可接入视觉/音频模型扩展能力</span>
+              </label>
+
+              {modalityExtended && (
+                <div className="provider-modality">
+                  <ProviderCard role="vision" title="视觉（识图）" />
+                  <div className="provider-card provider-card--disabled">
+                    <div className="provider-card__head">
+                      <span className="provider-card__title">
+                        <Lock size={13} style={{ verticalAlign: "-2px", marginRight: 4 }} />
+                        音频（语音）
+                      </span>
+                      <span className="provider-badge">🔒 敬请期待</span>
+                    </div>
+                    <p className="settings-desc" style={{ marginTop: 4 }}>
+                      后续接入语音模型，实现语音对话交流（占位禁用）。
+                    </p>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+
+          {section === "permission" && (
+            <>
+              <h3 className="settings-content__h">权限</h3>
+              <div className="settings-row">
                 <span className="settings-row__label">默认权限模式</span>
                 <select className="model-select" value={permissionMode} onChange={(e) => onPermissionModeChange(e.target.value as PermissionMode)}>
                   {PERMISSION_MODES.map((mode) => (
@@ -2434,11 +2755,11 @@ function findToolMarkupIndex(text: string): number {
 
 /** 把后端原始错误串映射为面向用户的友好提示与建议动作；未识别的错误保留原文便于反馈。 */
 function humanizeError(raw: string): string {
-  if (raw.includes("DEEPSEEK_API_KEY")) {
-    return "未检测到 API Key：请在 Windows 系统环境变量中配置 DEEPSEEK_API_KEY，然后重启应用。";
+  if (raw.includes("未配置主模型") || raw.includes("DEEPSEEK_API_KEY")) {
+    return "未配置主模型：请在 设置 → 模型供应商 中填写 API Key 与模型后再发送。";
   }
   if (raw.includes("认证失败")) {
-    return "API Key 无效：请检查系统环境变量 DEEPSEEK_API_KEY 是否填写正确。";
+    return "API Key 无效：请在 设置 → 模型供应商 检查 API Key 是否填写正确。";
   }
   if (raw.includes("余额不足")) {
     return "DeepSeek 账户余额不足：请前往 DeepSeek 开放平台充值后重试。";

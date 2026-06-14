@@ -178,6 +178,26 @@ pub fn init_db(path: &Path) -> SqlResult<Connection> {
             enabled    INTEGER NOT NULL DEFAULT 1,
             created_at INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS model_providers (
+            id          TEXT PRIMARY KEY,
+            role        TEXT NOT NULL,
+            preset      TEXT,
+            label       TEXT,
+            base_url    TEXT,
+            api_key     TEXT NOT NULL,
+            model_id    TEXT NOT NULL,
+            enabled     INTEGER NOT NULL DEFAULT 1,
+            updated_at  INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_model_providers_role
+            ON model_providers (role);
+
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         ",
     )?;
     add_column_if_missing(&conn, "conversations", "workspace_path", "TEXT")?;
@@ -567,6 +587,144 @@ pub fn remove_mcp_server(conn: &Connection, id: &str) -> SqlResult<()> {
     Ok(())
 }
 
+// ── Model Provider CRUD ──────────────────────────────────────────────────
+
+/// 模型供应商配置记录（按 role 角色化：main / vision / audio 预留）。
+///
+/// 一个 provider = 一个 OpenAI 兼容端点的接入参数。base_url 为空时由调用方按 preset
+/// 取内置官方端点；非空时为用户自定义覆盖（自托管/代理）。api_key 明文存储（local-first）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProvider {
+    pub id: String,
+    /// 'main' | 'vision' | 'audio'(预留)。
+    pub role: String,
+    /// 'deepseek'|'zhipu'|'moonshot'|'qwen'|'custom'，决定官方默认端点。
+    pub preset: Option<String>,
+    pub label: Option<String>,
+    /// 可空：空=用 preset 官方端点；非空=自定义覆盖。
+    pub base_url: Option<String>,
+    pub api_key: String,
+    pub model_id: String,
+    pub enabled: bool,
+    pub updated_at: Option<i64>,
+}
+
+/// 以 role 为唯一键 upsert 一个 provider（每个角色仅保留一条配置）。
+///
+/// 输入角色、预设、展示名、base_url（可空）、api_key、model_id；先删同 role 旧记录再插入新记录，
+/// 返回完整结构体。这样设置页对某个角色「保存」即覆盖该角色的全部字段，语义直观。
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_model_provider(
+    conn: &Connection,
+    role: &str,
+    preset: Option<&str>,
+    label: Option<&str>,
+    base_url: Option<&str>,
+    api_key: &str,
+    model_id: &str,
+) -> SqlResult<ModelProvider> {
+    let id = Uuid::new_v4().to_string();
+    let now = now_ts();
+    conn.execute("DELETE FROM model_providers WHERE role = ?1", params![role])?;
+    conn.execute(
+        "INSERT INTO model_providers
+         (id, role, preset, label, base_url, api_key, model_id, enabled, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8)",
+        params![id, role, preset, label, base_url, api_key, model_id, now],
+    )?;
+    Ok(ModelProvider {
+        id,
+        role: role.to_string(),
+        preset: preset.map(str::to_string),
+        label: label.map(str::to_string),
+        base_url: base_url.map(str::to_string),
+        api_key: api_key.to_string(),
+        model_id: model_id.to_string(),
+        enabled: true,
+        updated_at: Some(now),
+    })
+}
+
+/// 按角色读取 provider（main / vision），未配置返回 None。
+pub fn get_model_provider(conn: &Connection, role: &str) -> SqlResult<Option<ModelProvider>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, role, preset, label, base_url, api_key, model_id, enabled, updated_at
+         FROM model_providers
+         WHERE role = ?1
+         ORDER BY updated_at DESC
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query([role])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(ModelProvider {
+            id: row.get(0)?,
+            role: row.get(1)?,
+            preset: row.get(2)?,
+            label: row.get(3)?,
+            base_url: row.get(4)?,
+            api_key: row.get(5)?,
+            model_id: row.get(6)?,
+            enabled: row.get::<_, i64>(7)? != 0,
+            updated_at: row.get(8)?,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// 列出全部 provider 配置（含全部角色）。
+pub fn list_model_providers(conn: &Connection) -> SqlResult<Vec<ModelProvider>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, role, preset, label, base_url, api_key, model_id, enabled, updated_at
+         FROM model_providers
+         ORDER BY role ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ModelProvider {
+            id: row.get(0)?,
+            role: row.get(1)?,
+            preset: row.get(2)?,
+            label: row.get(3)?,
+            base_url: row.get(4)?,
+            api_key: row.get(5)?,
+            model_id: row.get(6)?,
+            enabled: row.get::<_, i64>(7)? != 0,
+            updated_at: row.get(8)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// 删除某角色的 provider（如关闭模态扩展时移除 vision provider）。
+pub fn delete_model_provider(conn: &Connection, role: &str) -> SqlResult<()> {
+    conn.execute("DELETE FROM model_providers WHERE role = ?1", params![role])?;
+    Ok(())
+}
+
+// ── App Settings (key-value) ──────────────────────────────────────────────
+
+/// 读取一项应用设置（如 modality_extended 模态扩展开关），不存在返回 None。
+pub fn get_setting(conn: &Connection, key: &str) -> SqlResult<Option<String>> {
+    let mut stmt = conn.prepare("SELECT value FROM app_settings WHERE key = ?1 LIMIT 1")?;
+    let mut rows = stmt.query([key])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get(0)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// 写入一项应用设置（upsert）。
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> SqlResult<()> {
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
 // ── Permission Rule CRUD ─────────────────────────────────────────────────
 
 /// 保存一条「总是允许」权限规则（如 `cmd:git push`、`tool:write_file`）；重复插入幂等。
@@ -829,6 +987,72 @@ mod tests {
         assert_eq!(conv.workspace_name.as_deref(), Some("NovaCode"));
         assert_eq!(conv.mode, "local_workspace");
         assert_eq!(stored[0].workspace_path.as_deref(), Some("C:\\workspace\\demo"));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn upserts_and_reads_model_provider_by_role() {
+        let db_path = std::env::temp_dir().join(format!("novacode-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+
+        // 首次配置主 provider（base_url 留空走官方）。
+        let p1 = upsert_model_provider(
+            &conn, "main", Some("deepseek"), Some("DeepSeek"), None, "sk-1", "deepseek-v4-pro",
+        )
+        .expect("upsert main");
+        assert_eq!(p1.role, "main");
+        assert_eq!(p1.base_url, None);
+
+        // 再次 upsert 同 role 覆盖（验证唯一性：只保留一条）。
+        let p2 = upsert_model_provider(
+            &conn, "main", Some("custom"), Some("自托管"), Some("https://proxy.local/v1"),
+            "sk-2", "my-model",
+        )
+        .expect("upsert main again");
+        assert_eq!(p2.api_key, "sk-2");
+
+        let loaded = get_model_provider(&conn, "main").expect("query").expect("exists");
+        assert_eq!(loaded.api_key, "sk-2");
+        assert_eq!(loaded.base_url.as_deref(), Some("https://proxy.local/v1"));
+        assert_eq!(loaded.model_id, "my-model");
+
+        // 仅一条 main，vision 未配。
+        assert!(get_model_provider(&conn, "vision").expect("query").is_none());
+
+        // 配 vision provider，列表含两角色。
+        upsert_model_provider(
+            &conn, "vision", Some("zhipu"), Some("GLM-4V"), None, "sk-v", "glm-4v",
+        )
+        .expect("upsert vision");
+        let all = list_model_providers(&conn).expect("list");
+        assert_eq!(all.len(), 2);
+
+        // 删除 vision。
+        delete_model_provider(&conn, "vision").expect("delete vision");
+        assert!(get_model_provider(&conn, "vision").expect("query").is_none());
+        assert_eq!(list_model_providers(&conn).expect("list").len(), 1);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn reads_and_writes_app_settings() {
+        let db_path = std::env::temp_dir().join(format!("novacode-storage-{}.db", Uuid::new_v4()));
+        let conn = init_db(&db_path).expect("db should initialize");
+
+        assert_eq!(get_setting(&conn, "modality_extended").expect("get"), None);
+        set_setting(&conn, "modality_extended", "true").expect("set");
+        assert_eq!(
+            get_setting(&conn, "modality_extended").expect("get").as_deref(),
+            Some("true")
+        );
+        // upsert 覆盖。
+        set_setting(&conn, "modality_extended", "false").expect("set again");
+        assert_eq!(
+            get_setting(&conn, "modality_extended").expect("get").as_deref(),
+            Some("false")
+        );
 
         let _ = std::fs::remove_file(db_path);
     }

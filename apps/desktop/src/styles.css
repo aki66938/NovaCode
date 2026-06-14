@@ -1424,6 +1424,162 @@ h1 {
   margin-top: 8px;
 }
 
+/* ── 模型供应商卡片（Plan17 §6.2）：两栏网格 + base_url 折叠 + 状态徽标 ── */
+.provider-card {
+  margin-top: 12px;
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+}
+
+.provider-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.provider-card__title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.provider-badge {
+  font-size: 12px;
+  color: var(--text-3);
+  padding: 2px 8px;
+  border-radius: var(--radius-tag);
+  background: var(--surface-3);
+  white-space: nowrap;
+}
+
+.provider-badge--on {
+  color: var(--success);
+  background: var(--diff-add-bg);
+}
+
+.provider-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 14px;
+}
+
+.provider-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.provider-field--full {
+  grid-column: 1 / -1;
+}
+
+.provider-field__label {
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.provider-input {
+  margin-bottom: 0 !important;
+  width: 100%;
+}
+
+.provider-key {
+  position: relative;
+  display: block;
+}
+
+.provider-key .provider-input {
+  padding-right: 36px;
+}
+
+.provider-key__eye {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  padding: 2px;
+}
+
+.provider-key__eye:hover {
+  color: var(--text-2);
+}
+
+.provider-advanced-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 0;
+}
+
+.provider-advanced-toggle:hover:not(:disabled) {
+  color: var(--text-2);
+}
+
+.provider-advanced-toggle:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.provider-advanced {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.22s ease;
+}
+
+.provider-advanced--open {
+  grid-template-rows: 1fr;
+}
+
+.provider-advanced__inner {
+  overflow: hidden;
+  min-height: 0;
+  padding-top: 6px;
+}
+
+.provider-card__actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+
+.provider-modality-toggle {
+  display: flex;
+  align-items: flex-start;
+  margin-top: 18px;
+  font-size: 12.5px;
+}
+
+.provider-modality {
+  margin-top: 4px;
+  animation: provider-fade-in 0.3s ease;
+}
+
+@keyframes provider-fade-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.provider-card--disabled {
+  opacity: 0.6;
+  background: var(--surface-2);
+  pointer-events: none;
+}
+
 .changes-list {
   display: flex;
   flex-direction: column;

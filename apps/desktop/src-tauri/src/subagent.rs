@@ -36,6 +36,7 @@ const SUBTASK_MAX_ROUNDS: usize = 15;
 /// run_subtask 工具：用独立上下文跑一个只读探索子代理，返回简明报告与消耗的 usage。
 /// 子代理只能 list/read/search/stat，工具事件以 `sub:` 前缀推给前端展示。
 pub(crate) async fn execute_run_subtask(
+    base_url: &str,
     api_key: &str,
     model: &str,
     workspace_path: &str,
@@ -93,6 +94,7 @@ pub(crate) async fn execute_run_subtask(
                 },
             );
         }
+        let base_url = base_url.to_string();
         let api_key = api_key.to_string();
         let model = model.to_string();
         let workspace_owned = workspace_path.to_string();
@@ -102,6 +104,7 @@ pub(crate) async fn execute_run_subtask(
         let task_id_done = task_id.clone();
         tauri::async_runtime::spawn(async move {
             let (text, sub_usage) = run_subtask_loop(
+                &base_url,
                 &api_key,
                 &model,
                 &workspace_owned,
@@ -139,6 +142,7 @@ pub(crate) async fn execute_run_subtask(
 
     // 前台：同步等待子代理 loop 完成，usage 并入当轮账本。
     let (report, usage) = run_subtask_loop(
+        base_url,
         api_key,
         model,
         workspace_path,
@@ -155,6 +159,7 @@ pub(crate) async fn execute_run_subtask(
 /// 子代理工具循环主体（前台/后台共用）。后台模式下每轮检查 cancel 以支持 kill_task。
 #[allow(clippy::too_many_arguments)]
 async fn run_subtask_loop(
+    base_url: &str,
     api_key: &str,
     model: &str,
     workspace_path: &str,
@@ -185,6 +190,7 @@ async fn run_subtask_loop(
             break;
         }
         let completion = match chat_completion_with_retry(
+            base_url,
             api_key,
             wire.clone(),
             model,
